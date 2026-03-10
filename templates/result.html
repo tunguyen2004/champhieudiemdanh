@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="vi">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Kết quả chấm phiếu — THPT 2025</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+
+<body>
+    <div class="container">
+        <header>
+            <h1>Kết quả chấm phiếu</h1>
+            <p class="subtitle">Đã xử lý {{ results|length }} phiếu</p>
+        </header>
+
+        <!-- Nút tải xuống -->
+        <div class="download-bar">
+            <a href="/download/json/{{ json_name }}" class="btn btn-secondary">Tải JSON</a>
+            <a href="/download/csv/{{ result_id }}" class="btn btn-secondary">Tải CSV</a>
+            <a href="/" class="btn btn-outline">Chấm phiếu mới</a>
+        </div>
+
+        <!-- Danh sách kết quả -->
+        {% for item in results %}
+        <div class="result-card {% if item.err %}has-error{% endif %}">
+            <div class="result-header">
+                <div>
+                    <h3>{{ item._original_name or item.org }}</h3>
+                    <span class="badge badge-sbd">SBD: {{ item.sbd or '---' }}</span>
+                    <span class="badge badge-mdt">MĐT: {{ item.mdt or '---' }}</span>
+                </div>
+                <button class="btn btn-sm toggle-detail" onclick="toggleDetail(this)">Chi tiết ▼</button>
+            </div>
+
+            {% if item.warn %}
+            <div class="alert alert-warning">
+                <strong>Cảnh báo:</strong> {{ item.warn }}
+            </div>
+            {% endif %}
+
+            {% if item.err %}
+            <div class="alert alert-error">
+                <strong>Lỗi:</strong>
+                {% for e in item.err %}
+                <span>{{ e }}</span>
+                {% endfor %}
+            </div>
+            {% endif %}
+
+            <!-- Ảnh đã đánh dấu -->
+            {% if item._marked_url %}
+            <div class="result-image">
+                <img src="{{ item._marked_url }}" alt="Ảnh đã chấm" loading="lazy" onclick="openFullscreen(this.src)">
+                <p class="hint">Nhấn vào ảnh để phóng to</p>
+            </div>
+            {% endif %}
+
+            <!-- Chi tiết đáp án -->
+            {% if item.res %}
+            <div class="detail-section" style="display:none;">
+                <!-- Phần I: Nhiều lựa chọn -->
+                <div class="answer-section">
+                    <h4>Phần I — Nhiều lựa chọn (40 câu)</h4>
+                    <div class="answer-grid fc-grid">
+                        {% for q in range(1, 41) %}
+                        {% set ans = item.res.fc.get(q|string, []) %}
+                        <div class="answer-cell {% if ans|length > 1 %}error{% elif ans|length == 0 %}empty{% endif %}">
+                            <span class="q-num">{{ q }}</span>
+                            <span class="q-ans">
+                                {% if ans %}
+                                {% for a in ans %}
+                                {{ ['A','B','C','D'][a] if a < 4 else '?' }} {% endfor %} {% else %} — {% endif %}
+                                    </span>
+                        </div>
+                        {% endfor %}
+                    </div>
+                </div>
+
+                <!-- Phần II: Đúng/Sai -->
+                <div class="answer-section">
+                    <h4>Phần II — Đúng/Sai (32 câu)</h4>
+                    <div class="answer-grid tf-grid">
+                        {% for q in range(1, 33) %}
+                        {% set ans = item.res.tf.get(q|string, []) %}
+                        <div class="answer-cell {% if ans|length > 1 %}error{% elif ans|length == 0 %}empty{% endif %}">
+                            <span class="q-num">{{ q }}</span>
+                            <span class="q-ans">
+                                {% if ans %}
+                                {% for a in ans %}
+                                {{ ['Đ','S'][a] if a < 2 else '?' }} {% endfor %} {% else %} — {% endif %} </span>
+                        </div>
+                        {% endfor %}
+                    </div>
+                </div>
+
+                <!-- Phần III: Trả lời ngắn -->
+                <div class="answer-section">
+                    <h4>Phần III — Trả lời ngắn (6 câu)</h4>
+                    <div class="answer-grid dg-grid">
+                        {% for q in range(1, 7) %}
+                        {% set ans = item.res.dg.get(q|string, '') %}
+                        <div class="answer-cell dg-cell {% if not ans %}empty{% endif %}">
+                            <span class="q-num">{{ q }}</span>
+                            <span class="q-ans">{{ ans if ans else '—' }}</span>
+                        </div>
+                        {% endfor %}
+                    </div>
+                </div>
+            </div>
+            {% endif %}
+
+            {% if item._debug_url %}
+            <div class="debug-section">
+                <h4>Ảnh Debug</h4>
+                <img src="{{ item._debug_url }}" alt="Debug" loading="lazy" onclick="openFullscreen(this.src)">
+            </div>
+            {% endif %}
+        </div>
+        {% endfor %}
+
+        <footer>
+            <p>Đồ án Xử lý ảnh — Chấm phiếu trắc nghiệm THPT 2025</p>
+        </footer>
+    </div>
+
+    <!-- Fullscreen overlay -->
+    <div id="fullscreen" class="fullscreen-overlay" onclick="closeFullscreen()" style="display:none;">
+        <img id="fullscreenImg" src="" alt="Phóng to">
+        <span class="close-btn">&times;</span>
+    </div>
+
+    <script>
+        function toggleDetail(btn) {
+            const card = btn.closest('.result-card');
+            const detail = card.querySelector('.detail-section');
+            if (detail) {
+                const visible = detail.style.display !== 'none';
+                detail.style.display = visible ? 'none' : 'block';
+                btn.textContent = visible ? 'Chi tiết ▼' : 'Ẩn ▲';
+            }
+        }
+
+        function openFullscreen(src) {
+            document.getElementById('fullscreenImg').src = src;
+            document.getElementById('fullscreen').style.display = 'flex';
+        }
+
+        function closeFullscreen() {
+            document.getElementById('fullscreen').style.display = 'none';
+        }
+
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') closeFullscreen();
+        });
+    </script>
+</body>
+
+</html>

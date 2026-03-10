@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="vi">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Chấm phiếu trắc nghiệm THPT 2025</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+
+<body>
+    <div class="container">
+        <header>
+            <h1>Hệ thống chấm phiếu trắc nghiệm</h1>
+            <p class="subtitle">Mẫu thử nghiệm kỳ thi THPT 2025</p>
+        </header>
+
+        {% if error %}
+        <div class="alert alert-error">{{ error }}</div>
+        {% endif %}
+
+        <main class="upload-section">
+            <form action="/process" method="POST" enctype="multipart/form-data" id="uploadForm">
+                <div class="upload-area" id="dropZone">
+                    <div class="upload-icon">📄</div>
+                    <h3>Kéo thả ảnh phiếu trắc nghiệm vào đây</h3>
+                    <p>hoặc nhấn để chọn file</p>
+                    <input type="file" name="files" id="fileInput" multiple accept=".jpg,.jpeg,.png,.bmp,.tiff,.tif"
+                        hidden>
+                    <p class="hint">Hỗ trợ: JPG, PNG, BMP, TIFF — Tối đa 16MB/file</p>
+                </div>
+
+                <div id="fileList" class="file-list" style="display:none;">
+                    <h4>Danh sách file đã chọn:</h4>
+                    <ul id="fileNames"></ul>
+                </div>
+
+                <div class="options">
+                    <label class="checkbox-label">
+                        <input type="checkbox" name="debug" value="1">
+                        Chế độ Debug (hiển thị ảnh phân tích chi tiết)
+                    </label>
+                </div>
+
+                <button type="submit" class="btn btn-primary" id="submitBtn" disabled>
+                    Bắt đầu chấm phiếu
+                </button>
+            </form>
+        </main>
+
+        <section class="info-section">
+            <h2>Hướng dẫn sử dụng</h2>
+            <div class="info-grid">
+                <div class="info-card">
+                    <h4>1. Chuẩn bị ảnh</h4>
+                    <p>Chụp hoặc scan phiếu trả lời trắc nghiệm. Đảm bảo ảnh rõ nét, đủ ánh sáng.</p>
+                </div>
+                <div class="info-card">
+                    <h4>2. Tải lên</h4>
+                    <p>Kéo thả hoặc chọn file ảnh. Có thể xử lý nhiều phiếu cùng lúc.</p>
+                </div>
+                <div class="info-card">
+                    <h4>3. Xem kết quả</h4>
+                    <p>Hệ thống tự động nhận diện đáp án và hiển thị kết quả chi tiết.</p>
+                </div>
+                <div class="info-card">
+                    <h4>4. Xuất file</h4>
+                    <p>Tải kết quả dưới dạng JSON hoặc CSV để lưu trữ hoặc xử lý thêm.</p>
+                </div>
+            </div>
+        </section>
+
+        <footer>
+            <p>Đồ án Xử lý ảnh — Chấm phiếu trắc nghiệm THPT 2025</p>
+        </footer>
+    </div>
+
+    <script>
+        const dropZone = document.getElementById('dropZone');
+        const fileInput = document.getElementById('fileInput');
+        const fileList = document.getElementById('fileList');
+        const fileNames = document.getElementById('fileNames');
+        const submitBtn = document.getElementById('submitBtn');
+        const form = document.getElementById('uploadForm');
+
+        // Click to upload
+        dropZone.addEventListener('click', () => fileInput.click());
+
+        // Drag & Drop
+        dropZone.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            dropZone.classList.add('dragover');
+        });
+        dropZone.addEventListener('dragleave', () => {
+            dropZone.classList.remove('dragover');
+        });
+        dropZone.addEventListener('drop', (e) => {
+            e.preventDefault();
+            dropZone.classList.remove('dragover');
+            fileInput.files = e.dataTransfer.files;
+            updateFileList();
+        });
+
+        fileInput.addEventListener('change', updateFileList);
+
+        function updateFileList() {
+            const files = fileInput.files;
+            if (files.length > 0) {
+                fileList.style.display = 'block';
+                fileNames.innerHTML = '';
+                for (let f of files) {
+                    const li = document.createElement('li');
+                    li.textContent = `${f.name} (${(f.size / 1024).toFixed(1)} KB)`;
+                    fileNames.appendChild(li);
+                }
+                submitBtn.disabled = false;
+            } else {
+                fileList.style.display = 'none';
+                submitBtn.disabled = true;
+            }
+        }
+
+        form.addEventListener('submit', () => {
+            submitBtn.disabled = true;
+            submitBtn.textContent = 'Đang xử lý...';
+        });
+    </script>
+</body>
+
+</html>
