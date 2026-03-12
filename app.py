@@ -98,7 +98,9 @@ def process():
     return render_template("result.html",
                            results=all_results,
                            result_id=result_id,
-                           json_name=json_name)
+                           json_name=json_name,
+                           tf_groups=config["regions"]["tf"]["groups"],
+                           tf_labels=config["regions"]["tf"]["labels"])
 
 
 @app.route("/api/process", methods=["POST"])

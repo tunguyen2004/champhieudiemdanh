@@ -264,8 +264,50 @@ header h1 {
 .fc-grid {
   grid-template-columns: repeat(10, 1fr);
 }
-.tf-grid {
-  grid-template-columns: repeat(8, 1fr);
+/* TF Grouped by Câu */
+.tf-grouped {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.tf-cau-card {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: #f0fdf4;
+}
+.tf-cau-header {
+  font-weight: 700;
+  font-size: 0.9rem;
+  color: var(--primary);
+  min-width: 55px;
+}
+.tf-cau-parts {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+.tf-part {
+  font-size: 0.9rem;
+  font-weight: 600;
+  padding: 2px 4px;
+  border-radius: 3px;
+}
+.tf-part.empty {
+  color: var(--text-light);
+}
+.tf-part.error {
+  color: var(--error);
+  background: #fef2f2;
+}
+.tf-sep {
+  color: var(--text-light);
+  font-size: 0.85rem;
+  margin: 0 2px;
 }
 .dg-grid {
   grid-template-columns: repeat(6, 1fr);
@@ -387,8 +429,8 @@ footer {
   .fc-grid {
     grid-template-columns: repeat(5, 1fr);
   }
-  .tf-grid {
-    grid-template-columns: repeat(4, 1fr);
+  .tf-cau-card {
+    flex-wrap: wrap;
   }
   .dg-grid {
     grid-template-columns: repeat(3, 1fr);
