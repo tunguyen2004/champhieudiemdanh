@@ -115,6 +115,7 @@ def visualize_results(warped_img, results, config):
     # --- TF (Phần II) ---
     tf_data = results.get("tf", {})
     tf_labels = regions["tf"]["labels"]
+    tf_margin = config.get("tf_bubble_margin", margin)
     for group in regions["tf"]["groups"]:
         questions = group.get("questions")
         start_q = group.get("start_question", 1)
@@ -122,7 +123,7 @@ def visualize_results(warped_img, results, config):
             q_num = str(questions[r]) if questions and r < len(questions) else str(start_q + r)
             filled = tf_data.get(q_num, [])
             for c in range(group["cols"]):
-                rect = get_bubble_rect(group, r, c, w, h, margin)
+                rect = get_bubble_rect(group, r, c, w, h, tf_margin)
                 x1, y1, x2, y2 = rect
                 if c in filled:
                     color = COLOR_ERROR if len(filled) > 1 else COLOR_FILLED
