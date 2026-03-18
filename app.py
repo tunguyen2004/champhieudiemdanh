@@ -32,6 +32,35 @@ def allowed_file(filename):
     return os.path.splitext(filename)[1].lower() in ALLOWED_EXTENSIONS
 
 
+def flatten_tf_for_csv(tf_data, tf_labels):
+    """
+    Chuẩn hóa TF về 32 cột CSV theo thứ tự:
+    1a,1b,1c,1d, 2a...8d.
+    Hỗ trợ cả schema mới (8 câu × a,b,c,d) và schema cũ (1..32).
+    """
+    if not isinstance(tf_data, dict):
+        return [""] * 32
+
+    first_value = next(iter(tf_data.values()), None)
+    flattened = []
+
+    if isinstance(first_value, dict):
+        sub_labels = ["a", "b", "c", "d"]
+        for q_num in range(1, 9):
+            question_data = tf_data.get(str(q_num), {})
+            for sub in sub_labels:
+                ans = question_data.get(sub, []) if isinstance(question_data, dict) else []
+                flattened.append(",".join(tf_labels[a] for a in ans if a < len(tf_labels)))
+    else:
+        for i in range(1, 33):
+            ans = tf_data.get(str(i), [])
+            flattened.append(",".join(tf_labels[a] for a in ans if a < len(tf_labels)))
+
+    if len(flattened) < 32:
+        flattened.extend([""] * (32 - len(flattened)))
+    return flattened[:32]
+
+
 @app.route("/")
 def index():
     return render_template("index.html")
@@ -175,7 +204,7 @@ def download_csv(result_id):
 
     # Header
     fc_cols = [f"FC_{i}" for i in range(1, 41)]
-    tf_cols = [f"TF_{i}" for i in range(1, 33)]
+    tf_cols = [f"TF_{q}{sub}" for q in range(1, 9) for sub in ["a", "b", "c", "d"]]
     dg_cols = [f"DG_{i}" for i in range(1, 7)]
     writer.writerow(["STT", "File", "SBD", "MĐT"] + fc_cols + tf_cols + dg_cols + ["Cảnh báo", "Lỗi"])
 
@@ -192,16 +221,13 @@ def download_csv(result_id):
                 row.append(",".join(labels[a] for a in ans if a < len(labels)))
 
             tf = res.get("tf", {})
-            for i in range(1, 33):
-                ans = tf.get(str(i), [])
-                labels = ["Đ", "S"]
-                row.append(",".join(labels[a] for a in ans if a < len(labels)))
+            row.extend(flatten_tf_for_csv(tf, ["Đ", "S"]))
 
             dg = res.get("dg", {})
             for i in range(1, 7):
                 row.append(dg.get(str(i), ""))
         else:
-            row.extend([""] * (40 + 32 + 6))
+            row.extend([""] * (40 + len(tf_cols) + 6))
 
         row.append(item.get("warn", ""))
         row.append("; ".join(item.get("err", [])))

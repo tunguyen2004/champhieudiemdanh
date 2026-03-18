@@ -30,6 +30,35 @@
     "double_fill_threshold": 0.27,
     "bubble_margin": 0.15,
     "tf_bubble_margin": 0.15,
+    "dg_bubble_margin": 0.15,
+    "tf_detection": {
+        "core_ratio": 0.62,
+        "signal_weight_fill": 0.7,
+        "signal_weight_darkness": 0.3,
+        "signal_weight_template": 0.8,
+        "min_signal": 0.18,
+        "min_signal_diff": 0.04,
+        "min_fill_ratio": 1.12,
+        "strong_fill": 0.32,
+        "weak_fill": 0.24,
+        "max_alt_fill": 0.26,
+        "both_fill": 0.38,
+        "ambiguous_signal_diff": 0.01,
+        "min_template_delta": 0.09,
+        "min_template_diff": 0.02,
+        "auto_calibrate_y": false
+    },
+    "dg_detection": {
+        "min_gap_12": 3.0,
+        "min_gap_median": 5.0,
+        "max_mark_mean": 248.0,
+        "row11_guard": true,
+        "row11_min_gap_12": 22.0,
+        "row11_min_gap_median": 30.0,
+        "min_fill_gap": 0.05,
+        "min_fill_median_gap": 0.08,
+        "max_fill_noise": 0.9
+    },
     "regions": {
         "sbd": {
             "x1": 0.739,
@@ -120,116 +149,76 @@
         "tf": {
             "groups": [
                 {
+                    "question": 1,
                     "x1": 0.069,
-                    "y1": 0.588,
+                    "y1": 0.609,
                     "x2": 0.152,
-                    "y2": 0.684,
+                    "y2": 0.678,
                     "rows": 4,
-                    "cols": 2,
-                    "questions": [
-                        1,
-                        5,
-                        9,
-                        13
-                    ]
+                    "cols": 2
                 },
                 {
+                    "question": 2,
                     "x1": 0.152,
-                    "y1": 0.588,
+                    "y1": 0.609,
                     "x2": 0.235,
-                    "y2": 0.684,
+                    "y2": 0.678,
                     "rows": 4,
-                    "cols": 2,
-                    "questions": [
-                        2,
-                        6,
-                        10,
-                        14
-                    ]
+                    "cols": 2
                 },
                 {
+                    "question": 3,
                     "x1": 0.305,
-                    "y1": 0.588,
+                    "y1": 0.609,
                     "x2": 0.388,
-                    "y2": 0.684,
+                    "y2": 0.678,
                     "rows": 4,
-                    "cols": 2,
-                    "questions": [
-                        3,
-                        7,
-                        11,
-                        15
-                    ]
+                    "cols": 2
                 },
                 {
+                    "question": 4,
                     "x1": 0.388,
-                    "y1": 0.588,
+                    "y1": 0.609,
                     "x2": 0.47,
-                    "y2": 0.684,
+                    "y2": 0.678,
                     "rows": 4,
-                    "cols": 2,
-                    "questions": [
-                        4,
-                        8,
-                        12,
-                        16
-                    ]
+                    "cols": 2
                 },
                 {
+                    "question": 5,
                     "x1": 0.538,
-                    "y1": 0.588,
+                    "y1": 0.609,
                     "x2": 0.621,
-                    "y2": 0.684,
+                    "y2": 0.678,
                     "rows": 4,
-                    "cols": 2,
-                    "questions": [
-                        17,
-                        21,
-                        25,
-                        29
-                    ]
+                    "cols": 2
                 },
                 {
+                    "question": 6,
                     "x1": 0.621,
-                    "y1": 0.588,
+                    "y1": 0.609,
                     "x2": 0.704,
-                    "y2": 0.684,
+                    "y2": 0.678,
                     "rows": 4,
-                    "cols": 2,
-                    "questions": [
-                        18,
-                        22,
-                        26,
-                        30
-                    ]
+                    "cols": 2
                 },
                 {
+                    "question": 7,
                     "x1": 0.775,
-                    "y1": 0.588,
+                    "y1": 0.609,
                     "x2": 0.861,
-                    "y2": 0.684,
+                    "y2": 0.678,
                     "rows": 4,
-                    "cols": 2,
-                    "questions": [
-                        19,
-                        23,
-                        27,
-                        31
-                    ]
+                    "cols": 2
                 },
                 {
+                    "question": 8,
                     "x1": 0.861,
-                    "y1": 0.588,
+                    "y1": 0.609,
                     "x2": 0.947,
-                    "y2": 0.684,
+                    "y2": 0.678,
                     "rows": 4,
-                    "cols": 2,
-                    "questions": [
-                        20,
-                        24,
-                        28,
-                        32
-                    ]
+                    "cols": 2
                 }
             ],
             "labels": [

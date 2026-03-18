@@ -144,20 +144,37 @@ def format_results(output, config):
     lines.append("  PHẦN II - Trắc nghiệm Đúng/Sai (8 câu × 4 ý):")
     tf_groups = config["regions"]["tf"]["groups"]
     sub_labels = ["a", "b", "c", "d"]
-    for g_idx, group in enumerate(tf_groups):
-        cau_num = g_idx + 1
-        questions = group.get("questions", [])
+    tf_count = 0
+    for g_idx, group in enumerate(tf_groups, start=1):
+        cau_num = str(group.get("question", g_idx))
         parts = []
-        for r_idx, q_num in enumerate(questions):
-            ans = tf.get(str(q_num), [])
-            sub = sub_labels[r_idx] if r_idx < len(sub_labels) else str(r_idx)
-            if ans:
-                txt = ",".join(tf_labels[a] for a in ans if a < len(tf_labels))
-            else:
-                txt = "_"
-            parts.append(f"{sub}={txt}")
+
+        question_data = tf.get(cau_num, {})
+        if isinstance(question_data, dict):
+            for sub in sub_labels:
+                ans = question_data.get(sub, [])
+                if ans:
+                    txt = ",".join(tf_labels[a] for a in ans if a < len(tf_labels))
+                    tf_count += 1
+                else:
+                    txt = "_"
+                parts.append(f"{sub}={txt}")
+        else:
+            questions = group.get("questions", [])
+            for r_idx in range(len(sub_labels)):
+                sub = sub_labels[r_idx]
+                if questions and r_idx < len(questions):
+                    ans = tf.get(str(questions[r_idx]), [])
+                else:
+                    ans = []
+                if ans:
+                    txt = ",".join(tf_labels[a] for a in ans if a < len(tf_labels))
+                    tf_count += 1
+                else:
+                    txt = "_"
+                parts.append(f"{sub}={txt}")
+
         lines.append(f"  Câu {cau_num}: " + " | ".join(parts))
-    tf_count = sum(1 for i in range(1, 33) if tf.get(str(i), []))
     lines.append(f"  => Đã trả lời: {tf_count}/32")
 
     # --- PHẦN III ---

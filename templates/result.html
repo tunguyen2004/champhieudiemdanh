@@ -85,13 +85,16 @@
                         {% for group in tf_groups %}
                         {% set cau_num = loop.index %}
                         {% set sub_labels = ['a', 'b', 'c', 'd'] %}
-                        {% set questions = group.get('questions', []) %}
+                        {% set tf_question = item.res.tf.get(cau_num|string, {}) %}
                         <div class="tf-cau-card">
                             <div class="tf-cau-header">Câu {{ cau_num }}</div>
                             <div class="tf-cau-parts">
-                                {% for q_num in questions %}
-                                {% set ans = item.res.tf.get(q_num|string, []) %}
-                                {% set sub = sub_labels[loop.index0] if loop.index0 < 4 else '?' %}
+                                {% for sub in sub_labels %}
+                                {% if tf_question is mapping %}
+                                {% set ans = tf_question.get(sub, []) %}
+                                {% else %}
+                                {% set ans = [] %}
+                                {% endif %}
                                 <span class="tf-part {% if ans|length > 1 %}error{% elif ans|length == 0 %}empty{% endif %}">
                                     {{ sub }}={% if ans %}{% for a in ans %}{{ tf_labels[a] if a < tf_labels|length else '?' }}{% endfor %}{% else %}—{% endif %}
                                 </span>

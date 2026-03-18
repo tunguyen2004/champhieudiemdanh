@@ -184,19 +184,22 @@ def find_sheet_by_ink(img):
 def find_corners(img, binary, config=None):
     """
     Tìm 4 góc phiếu - thử nhiều phương pháp theo thứ tự ưu tiên:
-    1. Corner markers (nếu phiếu có 4 hình vuông đen ở 4 góc)
-    2. Ink-based detection (dùng toàn bộ nội dung in để tìm vùng phiếu)
+    1. Ink-based detection (dùng toàn bộ nội dung in để tìm vùng phiếu)
+    2. Corner markers (nếu phiếu có 4 hình vuông đen ở 4 góc)
     3. Contour fallback (tìm contour hình chữ nhật lớn nhất)
-    """
-    # Phương pháp 1: Corner markers
-    corners = find_corner_markers(binary, config)
-    if corners is not None:
-        return corners, "markers"
 
-    # Phương pháp 2: Ink-based (robust nhất cho phiếu quét)
+    Ưu tiên ink-based để giảm lỗi bám nhầm marker ở mép giấy
+    (dễ gây crop lệch và sinh mép đen sau warp).
+    """
+    # Phương pháp 1: Ink-based (robust nhất cho phiếu quét)
     corners = find_sheet_by_ink(img)
     if corners is not None:
         return corners, "ink"
+
+    # Phương pháp 2: Corner markers
+    corners = find_corner_markers(binary, config)
+    if corners is not None:
+        return corners, "markers"
 
     # Phương pháp 3: Contour fallback
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img

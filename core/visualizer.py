@@ -15,6 +15,8 @@ COLOR_ERROR = (0, 0, 255)       # Đỏ - lỗi
 COLOR_EMPTY = (200, 200, 200)   # Xám - trống
 COLOR_TEXT = (0, 0, 200)        # Đỏ đậm cho text
 COLOR_GRID = (180, 180, 180)    # Xám nhạt cho grid
+MARK_RADIUS_DEFAULT = 1.0
+TF_MARK_RADIUS_SCALE = 0.72
 
 
 def draw_bubble_grid(img, region, fill_threshold, margin, labels=None, section_name=""):
@@ -51,14 +53,36 @@ def draw_bubble_grid(img, region, fill_threshold, margin, labels=None, section_n
     return marked
 
 
-def _mark_bubble(marked, overlay, rect, color):
+def _mark_bubble(marked, overlay, rect, color, radius_scale=MARK_RADIUS_DEFAULT):
     """Đánh dấu bubble: vẽ overlay bán trong suốt + viền."""
     x1, y1, x2, y2 = rect
     cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
     rx, ry = (x2 - x1) // 2, (y2 - y1) // 2
-    r = min(rx, ry)
+    r = max(int(min(rx, ry) * radius_scale), 1)
     cv2.circle(overlay, (cx, cy), r, color, -1)
     cv2.circle(marked, (cx, cy), r, color, 2)
+
+
+def _get_tf_filled(tf_data, group, group_index, row_index):
+    """Lấy đáp án TF theo schema mới (8 câu × a,b,c,d), có fallback schema cũ."""
+    question_key = str(group.get("question", group_index + 1))
+    question_data = tf_data.get(question_key, {})
+
+    if isinstance(question_data, dict):
+        sub_labels = ["a", "b", "c", "d"]
+        if row_index < len(sub_labels):
+            ans = question_data.get(sub_labels[row_index], [])
+            return ans if isinstance(ans, list) else []
+        return []
+
+    questions = group.get("questions")
+    start_q = group.get("start_question", 1)
+    if questions and row_index < len(questions):
+        legacy_key = str(questions[row_index])
+    else:
+        legacy_key = str(start_q + row_index)
+    legacy_ans = tf_data.get(legacy_key, [])
+    return legacy_ans if isinstance(legacy_ans, list) else []
 
 
 def visualize_results(warped_img, results, config):
@@ -116,18 +140,17 @@ def visualize_results(warped_img, results, config):
     tf_data = results.get("tf", {})
     tf_labels = regions["tf"]["labels"]
     tf_margin = config.get("tf_bubble_margin", margin)
-    for group in regions["tf"]["groups"]:
-        questions = group.get("questions")
-        start_q = group.get("start_question", 1)
+    for group_index, group in enumerate(regions["tf"]["groups"], start=1):
         for r in range(group["rows"]):
-            q_num = str(questions[r]) if questions and r < len(questions) else str(start_q + r)
-            filled = tf_data.get(q_num, [])
+            filled = _get_tf_filled(tf_data, group, group_index, r)
             for c in range(group["cols"]):
                 rect = get_bubble_rect(group, r, c, w, h, tf_margin)
                 x1, y1, x2, y2 = rect
                 if c in filled:
                     color = COLOR_ERROR if len(filled) > 1 else COLOR_FILLED
-                    _mark_bubble(marked, overlay, rect, color)
+                    _mark_bubble(
+                        marked, overlay, rect, color, radius_scale=TF_MARK_RADIUS_SCALE
+                    )
                     label = tf_labels[c] if c < len(tf_labels) else str(c)
                     cv2.putText(marked, label, (x1 + 2, y2 - 2),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)

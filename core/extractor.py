@@ -11,6 +11,8 @@ Edge Cases được xử lý:
 import cv2
 import numpy as np
 
+_TEMPLATE_GRAY_CACHE = {}
+
 
 def auto_calibrate_grid_y(grayscale, region, img_h, img_w, margin=0.15):
     """
@@ -415,6 +417,88 @@ def detect_grid_answers(binary, region, fill_threshold, double_threshold, margin
     return answers, warnings
 
 
+def _id_column_stats(binary, grayscale, region, col, img_w, img_h, margin=0.15):
+    """
+    Tính thống kê cho 1 cột ID (SBD/MDT):
+    - min_row theo intensity (xám)
+    - intensity_gap = second_min - min
+    - fill_row theo fill_ratio (binary)
+    - fill_top_ratio = max_fill / second_fill
+    """
+    intensities = []
+    fills = []
+
+    for row in range(region["rows"]):
+        rect = get_bubble_rect(region, row, col, img_w, img_h, margin)
+        x1, y1, x2, y2 = rect
+
+        roi_gray = grayscale[y1:y2, x1:x2]
+        mean_val = float(np.mean(roi_gray)) if roi_gray.size > 0 else 255.0
+        intensities.append(mean_val)
+
+        roi_bin = binary[y1:y2, x1:x2]
+        fill_val = float(cv2.countNonZero(roi_bin) / roi_bin.size) if roi_bin.size > 0 else 0.0
+        fills.append(fill_val)
+
+    min_row = int(np.argmin(intensities))
+    sorted_i = sorted(intensities)
+    intensity_gap = float(sorted_i[1] - sorted_i[0]) if len(sorted_i) > 1 else 0.0
+
+    fill_row = int(np.argmax(fills))
+    sorted_f = sorted(fills, reverse=True)
+    fill_top_ratio = float(sorted_f[0] / max(sorted_f[1], 1e-6)) if len(sorted_f) > 1 else 0.0
+
+    return min_row, intensity_gap, fill_row, fill_top_ratio
+
+
+def _recover_id_digit_with_local_offset(
+    binary, grayscale, region, col, img_w, img_h, margin=0.15,
+    search_px=12, step_px=2, min_votes=4
+):
+    """
+    Fallback cho cột ID đang mơ hồ:
+    - Dịch nhẹ trục y của cả grid quanh vị trí hiện tại
+    - Chỉ nhận offset có bằng chứng mạnh (gap >= 10 và intensity_row == fill_row)
+    - Chọn digit nếu số phiếu bầu đủ lớn và vượt rõ rệt
+    """
+    from collections import Counter
+
+    base_y1 = region["y1"]
+    grid_height = region["y2"] - region["y1"]
+    votes = Counter()
+
+    for offset_px in range(-search_px, search_px + 1, step_px):
+        dy = offset_px / img_h
+        test_y1 = base_y1 + dy
+        test_y2 = test_y1 + grid_height
+        if test_y1 < 0 or test_y2 > 1.0:
+            continue
+
+        test_region = dict(region)
+        test_region["y1"] = test_y1
+        test_region["y2"] = test_y2
+
+        min_row, gap, fill_row, _ = _id_column_stats(
+            binary, grayscale, test_region, col, img_w, img_h, margin
+        )
+        if gap >= 10 and min_row == fill_row:
+            votes[min_row] += 1
+
+    if not votes:
+        return None
+
+    ranked = votes.most_common()
+    top_row, top_votes = ranked[0]
+    second_votes = ranked[1][1] if len(ranked) > 1 else 0
+
+    if top_votes < min_votes:
+        return None
+    if top_votes - second_votes < 2:
+        return None
+
+    return int(top_row)
+
+
 def extract_sbd(binary, config, grayscale=None):
     """Trích xuất Số Báo Danh (6 chữ số). Dùng so sánh cường độ điểm ảnh."""
     region = config["regions"]["sbd"]
@@ -427,22 +511,19 @@ def extract_sbd(binary, config, grayscale=None):
     sbd = ""
     for col in range(region["cols"]):
         if grayscale is not None:
-            # Dùng cường độ xám (thấp = tối = đã tô)
-            intensities = []
-            for row in range(region["rows"]):
-                rect = get_bubble_rect(region, row, col, w, h, margin)
-                x1, y1, x2, y2 = rect
-                roi = grayscale[y1:y2, x1:x2]
-                mean_val = np.mean(roi) if roi.size > 0 else 255
-                intensities.append(mean_val)
-            min_val = min(intensities)
-            min_row = intensities.index(min_val)
-            sorted_i = sorted(intensities)
-            second_min = sorted_i[1] if len(sorted_i) > 1 else 255
-            if second_min > 0 and (second_min - min_val) > 10:
+            min_row, gap, _, _ = _id_column_stats(
+                binary, grayscale, region, col, w, h, margin
+            )
+            if gap > 10:
                 sbd += region["labels"][min_row]
             else:
-                sbd += "?"
+                recovered_row = _recover_id_digit_with_local_offset(
+                    binary, grayscale, region, col, w, h, margin
+                )
+                if recovered_row is not None:
+                    sbd += region["labels"][recovered_row]
+                else:
+                    sbd += "?"
         else:
             ratios = []
             for row in range(region["rows"]):
@@ -471,21 +552,19 @@ def extract_mdt(binary, config, grayscale=None):
     mdt = ""
     for col in range(region["cols"]):
         if grayscale is not None:
-            intensities = []
-            for row in range(region["rows"]):
-                rect = get_bubble_rect(region, row, col, w, h, margin)
-                x1, y1, x2, y2 = rect
-                roi = grayscale[y1:y2, x1:x2]
-                mean_val = np.mean(roi) if roi.size > 0 else 255
-                intensities.append(mean_val)
-            min_val = min(intensities)
-            min_row = intensities.index(min_val)
-            sorted_i = sorted(intensities)
-            second_min = sorted_i[1] if len(sorted_i) > 1 else 255
-            if second_min > 0 and (second_min - min_val) > 10:
+            min_row, gap, _, _ = _id_column_stats(
+                binary, grayscale, region, col, w, h, margin
+            )
+            if gap > 10:
                 mdt += region["labels"][min_row]
             else:
-                mdt += "?"
+                recovered_row = _recover_id_digit_with_local_offset(
+                    binary, grayscale, region, col, w, h, margin
+                )
+                if recovered_row is not None:
+                    mdt += region["labels"][recovered_row]
+                else:
+                    mdt += "?"
         else:
             ratios = []
             for row in range(region["rows"]):
@@ -555,119 +634,310 @@ def extract_fc(binary, config, grayscale=None):
     return fc_result, errors, warnings
 
 
+def _tf_core_metrics(binary, grayscale, rect, core_ratio=0.62):
+    """
+    Tính đặc trưng lõi bubble để giảm nhiễu từ viền/chữ/đường kẻ:
+    - core_fill: fill_ratio trong vùng ellipse trung tâm
+    - mean_intensity: cường độ xám trung bình trong vùng lõi
+    """
+    x1, y1, x2, y2 = rect
+    if x2 <= x1 or y2 <= y1:
+        return 0.0, 255.0
+
+    roi_bin = binary[y1:y2, x1:x2]
+    if roi_bin.size == 0:
+        return 0.0, 255.0
+
+    roi_h, roi_w = roi_bin.shape[:2]
+    mask = np.zeros((roi_h, roi_w), dtype=np.uint8)
+    center = (roi_w // 2, roi_h // 2)
+    axis_x = max(int((roi_w * core_ratio) / 2), 1)
+    axis_y = max(int((roi_h * core_ratio) / 2), 1)
+    cv2.ellipse(mask, center, (axis_x, axis_y), 0, 0, 360, 255, -1)
+
+    mask_pixels = cv2.countNonZero(mask)
+    if mask_pixels == 0:
+        return 0.0, 255.0
+
+    masked_bin = cv2.bitwise_and(roi_bin, roi_bin, mask=mask)
+    core_fill = cv2.countNonZero(masked_bin) / mask_pixels
+
+    if grayscale is None:
+        mean_intensity = 255.0 * (1.0 - core_fill)
+    else:
+        roi_gray = grayscale[y1:y2, x1:x2]
+        mean_intensity = cv2.mean(roi_gray, mask=mask)[0] if roi_gray.size > 0 else 255.0
+
+    return float(core_fill), float(mean_intensity)
+
+
+def _get_warped_template_gray(config, target_w, target_h):
+    """Lấy template đã warp về cùng hệ trục với ảnh aligned (có cache)."""
+    template_path = config.get(
+        "template_path",
+        "anh/sample_image/Copy of PhieuTracNghiepTHPT2025.png"
+    )
+    cache_key = (template_path, int(target_w), int(target_h))
+    if cache_key in _TEMPLATE_GRAY_CACHE:
+        return _TEMPLATE_GRAY_CACHE[cache_key]
+
+    try:
+        from .detector import TemplateAligner
+        aligner = TemplateAligner()
+        aligner._init_template(template_path, target_w, target_h)
+        tpl_warped = getattr(aligner, "_tpl_warped", None)
+        if tpl_warped is None:
+            _TEMPLATE_GRAY_CACHE[cache_key] = None
+        else:
+            _TEMPLATE_GRAY_CACHE[cache_key] = cv2.cvtColor(tpl_warped, cv2.COLOR_BGR2GRAY)
+    except Exception:
+        _TEMPLATE_GRAY_CACHE[cache_key] = None
+
+    return _TEMPLATE_GRAY_CACHE[cache_key]
+
+
+def _tf_template_delta(grayscale, template_gray, rect, core_ratio=0.62):
+    """
+    Mức độ tô thêm so với template trắng (đo trên lõi bubble):
+    template - current > 0 nghĩa là ảnh hiện tại tối hơn template.
+    """
+    if grayscale is None or template_gray is None:
+        return 0.0
+
+    x1, y1, x2, y2 = rect
+    if x2 <= x1 or y2 <= y1:
+        return 0.0
+
+    roi_cur = grayscale[y1:y2, x1:x2]
+    roi_tpl = template_gray[y1:y2, x1:x2]
+    if roi_cur.size == 0 or roi_tpl.size == 0:
+        return 0.0
+
+    roi_h, roi_w = roi_cur.shape[:2]
+    mask = np.zeros((roi_h, roi_w), dtype=np.uint8)
+    center = (roi_w // 2, roi_h // 2)
+    axis_x = max(int((roi_w * core_ratio) / 2), 1)
+    axis_y = max(int((roi_h * core_ratio) / 2), 1)
+    cv2.ellipse(mask, center, (axis_x, axis_y), 0, 0, 360, 255, -1)
+
+    mask_pixels = cv2.countNonZero(mask)
+    if mask_pixels == 0:
+        return 0.0
+
+    diff = roi_tpl.astype(np.int16) - roi_cur.astype(np.int16)
+    positive_delta = np.clip(diff, 0, None)
+    delta_mean = cv2.mean(positive_delta.astype(np.float32), mask=mask)[0]
+    return float(delta_mean / 255.0)
+
+
+def _tf_question_key(group, group_index):
+    return str(group.get("question", group_index + 1))
+
+
 def extract_tf(binary, config, grayscale=None):
     """
-    Trích xuất Phần II - Đúng/Sai (32 câu, 2 lựa chọn).
+    Trích xuất Phần II - Đúng/Sai đúng theo cấu trúc phiếu:
+    - 8 câu
+    - mỗi câu có 4 ý a,b,c,d
+    - mỗi ý chọn Đúng(0) hoặc Sai(1)
 
-    Phương pháp chính: Intensity-based comparison (so sánh cường độ xám
-    tương đối giữa 2 cột Đúng/Sai). Cột nào tối hơn rõ rệt → cột đó
-    được tô. Chính xác hơn fill_ratio cho grid nhỏ, sát nhau.
-
-    Fallback: robust_bubble_detection khi không có grayscale.
-
-    Output: {"1": [0], "2": [1], ...}  (0=Đúng, 1=Sai)
+    Output:
+    {
+      "1": {"a":[0], "b":[1], "c":[0], "d":[1]},
+      ...
+      "8": {"a":[...], ...}
+    }
     """
     tf_config = config["regions"]["tf"]
-    fill_threshold = config.get("fill_threshold", 0.40)
+    tf_det_cfg = config.get("tf_detection", {})
     margin = config.get("tf_bubble_margin", config.get("bubble_margin", 0.15))
-    h, w = binary.shape[:2]
+    core_ratio = tf_det_cfg.get("core_ratio", 0.62)
+    weight_fill = tf_det_cfg.get("signal_weight_fill", 0.7)
+    weight_darkness = tf_det_cfg.get("signal_weight_darkness", 0.3)
+    weight_template = tf_det_cfg.get("signal_weight_template", 0.6)
+    min_signal = tf_det_cfg.get("min_signal", 0.24)
+    min_signal_diff = tf_det_cfg.get("min_signal_diff", 0.08)
+    min_fill_ratio = tf_det_cfg.get("min_fill_ratio", 1.20)
+    strong_fill = tf_det_cfg.get("strong_fill", 0.32)
+    weak_fill = tf_det_cfg.get("weak_fill", 0.24)
+    max_alt_fill = tf_det_cfg.get("max_alt_fill", 0.26)
+    both_fill = tf_det_cfg.get("both_fill", 0.33)
+    ambiguous_signal_diff = tf_det_cfg.get("ambiguous_signal_diff", 0.02)
+    min_template_delta = tf_det_cfg.get("min_template_delta", 0.11)
+    min_template_diff = tf_det_cfg.get("min_template_diff", 0.02)
+    auto_calibrate_tf = tf_det_cfg.get("auto_calibrate_y", False)
 
-    # Auto-calibrate y cho từng TF group
+    h, w = binary.shape[:2]
+    sub_labels = ["a", "b", "c", "d"]
+    template_gray = _get_warped_template_gray(config, w, h) if grayscale is not None else None
+
     calibrated_groups = []
     for group in tf_config["groups"]:
-        cal_group = auto_calibrate_grid_y(grayscale, group, h, w, margin)
+        if auto_calibrate_tf:
+            cal_group = auto_calibrate_grid_y(grayscale, group, h, w, margin)
+        else:
+            cal_group = dict(group)
         calibrated_groups.append(cal_group)
 
     tf_result = {}
     errors = []
     warnings = []
 
-    for group in calibrated_groups:
-        questions = group.get("questions")
-        start_q = group.get("start_question", 1)
+    for group_idx, group in enumerate(calibrated_groups, start=1):
+        question_key = _tf_question_key(group, group_idx)
+        question_result = {}
 
-        for r in range(group["rows"]):
-            if questions and r < len(questions):
-                q_num = questions[r]
-            else:
-                q_num = start_q + r
+        for row_idx in range(min(group["rows"], len(sub_labels))):
+            sub_key = sub_labels[row_idx]
+            bubble_metrics = []
 
-            if grayscale is not None:
-                # === PHƯƠNG PHÁP CHÍNH: Intensity-based comparison ===
-                # So sánh cường độ xám giữa 2 cột (Đúng/Sai)
-                # Cột được tô sẽ có mean intensity THẤP hơn (tối hơn)
-                intensities = []
-                for c in range(group["cols"]):
-                    rect = get_bubble_rect(group, r, c, w, h, margin)
-                    x1, y1, x2, y2 = rect
-                    roi = grayscale[y1:y2, x1:x2]
-                    mean_val = np.mean(roi) if roi.size > 0 else 255
-                    intensities.append((c, mean_val))
-
-                # Sắp xếp: cột tối nhất trước
-                sorted_by_intensity = sorted(intensities, key=lambda x: x[1])
-                darkest_col, darkest_val = sorted_by_intensity[0]
-                lightest_col, lightest_val = sorted_by_intensity[-1]
-
-                # Chênh lệch intensity giữa 2 cột
-                intensity_diff = lightest_val - darkest_val
-
-                # Kiểm tra cột tối nhất có thực sự được tô không
-                # (không phải chỉ do viền/nhiễu)
-                darkest_rect = get_bubble_rect(group, r, darkest_col, w, h, margin)
-                darkest_fill = compute_fill_ratio(binary, darkest_rect)
-
-                if intensity_diff > 10 and darkest_val < 210:
-                    # Chênh lệch rõ ràng → cột tối hơn được tô
-                    filled = [darkest_col]
-                elif intensity_diff > 5 and darkest_fill >= fill_threshold:
-                    # Chênh lệch vừa phải nhưng fill_ratio cũng xác nhận
-                    filled = [darkest_col]
-                elif darkest_fill >= fill_threshold and darkest_val < 195:
-                    # Fill ratio cao + cột đủ tối → chấp nhận
-                    # Kiểm tra cột còn lại không bị tô
-                    lightest_rect = get_bubble_rect(group, r, lightest_col, w, h, margin)
-                    lightest_fill = compute_fill_ratio(binary, lightest_rect)
-                    if darkest_fill / max(lightest_fill, 0.001) >= 1.2:
-                        filled = [darkest_col]
-                    elif lightest_fill >= fill_threshold:
-                        # Cả 2 đều cao → nhiễu, bỏ qua
-                        filled = []
-                        warnings.append(f"TF câu {q_num}: Nhiễu biên (cả 2 cột đều cao)")
-                    else:
-                        filled = [darkest_col]
+            for col_idx in range(group["cols"]):
+                rect = get_bubble_rect(group, row_idx, col_idx, w, h, margin)
+                if grayscale is not None:
+                    core_fill, mean_intensity = _tf_core_metrics(
+                        binary, grayscale, rect, core_ratio=core_ratio
+                    )
+                    darkness = (255.0 - mean_intensity) / 255.0
+                    template_delta = _tf_template_delta(
+                        grayscale, template_gray, rect, core_ratio=core_ratio
+                    )
+                    signal = (
+                        weight_fill * core_fill
+                        + weight_darkness * darkness
+                        + weight_template * template_delta
+                    )
+                    bubble_metrics.append({
+                        "col": col_idx,
+                        "status": "core",
+                        "fill": core_fill,
+                        "signal": signal,
+                        "template_delta": template_delta
+                    })
                 else:
-                    # Không đủ chênh lệch → coi như trống
+                    status, robust_fill = robust_bubble_detection(binary, grayscale, rect, config)
+                    bubble_metrics.append({
+                        "col": col_idx,
+                        "status": status,
+                        "fill": robust_fill,
+                        "signal": robust_fill,
+                        "template_delta": 0.0
+                    })
+
+            first = bubble_metrics[0]
+            second = bubble_metrics[1]
+            if first["signal"] >= second["signal"]:
+                top = first
+                alt = second
+            else:
+                top = second
+                alt = first
+
+            signal_diff = top["signal"] - alt["signal"]
+            fill_ratio = top["fill"] / max(alt["fill"], 1e-6)
+            if grayscale is not None:
+                top_strong = top["fill"] >= strong_fill and top["signal"] >= min_signal
+                top_weak = top["fill"] >= weak_fill and top["signal"] >= min_signal
+                alt_low = alt["fill"] <= max_alt_fill
+                template_diff = top["template_delta"] - alt["template_delta"]
+                template_confident = (
+                    top["template_delta"] >= min_template_delta
+                    and template_diff >= min_template_diff
+                )
+
+                if (
+                    top["fill"] >= both_fill and alt["fill"] >= both_fill
+                    and signal_diff <= ambiguous_signal_diff
+                    and abs(template_diff) <= min_template_diff
+                ):
+                    filled = []
+                    warnings.append(
+                        f"TF câu {question_key} ý {sub_key}: Mơ hồ Đ/S (cả 2 cột đều mạnh)"
+                    )
+                elif template_confident:
+                    filled = [top["col"]]
+                elif top_strong and (alt_low or fill_ratio >= min_fill_ratio or signal_diff >= min_signal_diff):
+                    filled = [top["col"]]
+                elif top_weak and signal_diff >= min_signal_diff and fill_ratio >= min_fill_ratio:
+                    filled = [top["col"]]
+                else:
                     filled = []
             else:
-                # === FALLBACK: robust_bubble_detection (không có grayscale) ===
-                statuses = []
-                for c in range(group["cols"]):
-                    rect = get_bubble_rect(group, r, c, w, h, margin)
-                    status, fill = robust_bubble_detection(binary, grayscale, rect, config)
-                    statuses.append((c, status, fill))
-
-                vals = [fill for _, _, fill in statuses]
-                max_val = max(vals) if vals else 0
-                min_val = min(vals) if vals else 0
-                min_val = min_val if min_val > 0 else 0.001
-
-                robust_filled = [c for c, st, _ in statuses if st in ("filled", "pencil")]
-
-                if len(robust_filled) == 2 and len(vals) == 2:
-                    if max_val / min_val >= 1.3:
-                        filled = [c for c, _, fill in statuses if fill == max_val]
-                    else:
-                        filled = []
+                top_marked = top["status"] in ("filled", "pencil")
+                alt_marked = alt["status"] in ("filled", "pencil")
+                if top_marked and alt_marked and signal_diff <= ambiguous_signal_diff:
+                    filled = []
+                    warnings.append(
+                        f"TF câu {question_key} ý {sub_key}: Mơ hồ Đ/S (cả 2 cột cùng được đánh dấu)"
+                    )
+                elif top_marked and (not alt_marked):
+                    filled = [top["col"]]
+                elif top_marked and (signal_diff >= min_signal_diff or fill_ratio >= min_fill_ratio):
+                    filled = [top["col"]]
                 else:
-                    filled = robust_filled
+                    filled = []
 
-            if len(filled) > 1:
-                warnings.append(f"TF câu {q_num}: Tô cả Đúng và Sai")
+            question_result[sub_key] = filled
 
-            tf_result[str(q_num)] = filled
+        for missing_idx in range(len(question_result), len(sub_labels)):
+            question_result[sub_labels[missing_idx]] = []
+
+        tf_result[question_key] = question_result
 
     return tf_result, errors, warnings
+
+
+def _dg_column_gray_stats(grayscale, region, col, img_w, img_h, margin=0.15):
+    """
+    Thống kê 1 cột DG trên ảnh xám:
+    - top_row: hàng tối nhất
+    - top_mean: mean intensity hàng tối nhất
+    - second_mean: mean intensity hàng tối thứ 2
+    - median_mean: trung vị intensity toàn cột
+    """
+    means = []
+    rows = region["rows"]
+    for row in range(rows):
+        rect = get_bubble_rect(region, row, col, img_w, img_h, margin)
+        x1, y1, x2, y2 = rect
+        roi = grayscale[y1:y2, x1:x2]
+        mean_val = float(np.mean(roi)) if roi.size > 0 else 255.0
+        means.append(mean_val)
+
+    if not means:
+        return None, 255.0, 255.0, 255.0
+
+    order = sorted(range(len(means)), key=lambda idx: means[idx])
+    top_row = int(order[0])
+    top_mean = float(means[top_row])
+    second_mean = float(means[order[1]]) if len(order) > 1 else 255.0
+    median_mean = float(np.median(means))
+    return top_row, top_mean, second_mean, median_mean
+
+
+def _dg_column_binary_stats(binary, region, col, img_w, img_h, margin=0.15):
+    """
+    Thống kê 1 cột DG trên binary:
+    - top_row: hàng fill ratio cao nhất
+    - top_fill: fill ratio cao nhất
+    - second_fill: fill ratio cao thứ 2
+    - median_fill: trung vị fill ratio toàn cột
+    """
+    fills = []
+    rows = region["rows"]
+    for row in range(rows):
+        rect = get_bubble_rect(region, row, col, img_w, img_h, margin)
+        fill = compute_fill_ratio(binary, rect)
+        fills.append(float(fill))
+
+    if not fills:
+        return None, 0.0, 0.0, 0.0
+
+    order = sorted(range(len(fills)), key=lambda idx: fills[idx], reverse=True)
+    top_row = int(order[0])
+    top_fill = float(fills[top_row])
+    second_fill = float(fills[order[1]]) if len(order) > 1 else 0.0
+    median_fill = float(np.median(fills))
+    return top_row, top_fill, second_fill, median_fill
 
 
 def extract_dg(binary, config, grayscale=None):
@@ -680,8 +950,18 @@ def extract_dg(binary, config, grayscale=None):
     dg_config = config["regions"]["dg"]
     dg_labels = dg_config["labels"]
     dg_rows = dg_config["rows"]
+    dg_det_cfg = config.get("dg_detection", {})
+    margin = config.get("dg_bubble_margin", config.get("bubble_margin", 0.15))
     fill_threshold = config.get("fill_threshold", 0.40)
-    margin = config.get("bubble_margin", 0.15)
+    min_gap_12 = dg_det_cfg.get("min_gap_12", 3.0)
+    min_gap_median = dg_det_cfg.get("min_gap_median", 5.0)
+    max_mark_mean = dg_det_cfg.get("max_mark_mean", 248.0)
+    row11_guard = dg_det_cfg.get("row11_guard", True)
+    row11_min_gap_12 = dg_det_cfg.get("row11_min_gap_12", 22.0)
+    row11_min_gap_median = dg_det_cfg.get("row11_min_gap_median", 30.0)
+    min_fill_gap = dg_det_cfg.get("min_fill_gap", 0.05)
+    min_fill_median_gap = dg_det_cfg.get("min_fill_median_gap", 0.08)
+    max_fill_noise = dg_det_cfg.get("max_fill_noise", 0.90)
     h, w = binary.shape[:2]
 
     dg_result = {}
@@ -701,51 +981,58 @@ def extract_dg(binary, config, grayscale=None):
 
         for c in range(cols):
             if grayscale is not None:
-                # Dùng cường độ xám (thấp = tối = đã tô)
-                intensities = []
-                for r in range(dg_rows):
-                    rect = get_bubble_rect(region, r, c, w, h, margin)
-                    x1, y1, x2, y2 = rect
-                    roi = grayscale[y1:y2, x1:x2]
-                    mean_val = np.mean(roi) if roi.size > 0 else 255
-                    intensities.append(mean_val)
-                # Lọc nhiễu viền: bỏ qua bubble quá tối (< 50) - viền form/đường kẻ đậm
-                valid = [(r, v) for r, v in enumerate(intensities) if v >= 50]
-                if len(valid) < 2:
+                top_row, top_mean, second_mean, median_mean = _dg_column_gray_stats(
+                    grayscale, region, c, w, h, margin
+                )
+                if top_row is None:
                     continue
-                valid_vals = [v for _, v in valid]
-                min_val = min(valid_vals)
-                min_row = [r for r, v in valid if v == min_val][0]
-                sorted_v = sorted(valid_vals)
-                second_min = sorted_v[1] if len(sorted_v) > 1 else 255
-                median_val = sorted_v[len(sorted_v)//2]
-                # Điều kiện phát hiện bubble được tô:
-                # 1. Median > 150 (phần lớn bubble trắng)
-                # 2. Chênh lệch min vs second > 15
-                # 3. Min > 60% median (loại noise cấu trúc form - quá tối so với nền)
-                if (median_val > 150 and (second_min - min_val) > 15
-                        and min_val > median_val * 0.60
-                        and min_row < len(dg_labels)):
-                    answer += dg_labels[min_row]
+
+                gap_12 = second_mean - top_mean
+                gap_median = median_mean - top_mean
+                is_mark = (
+                    top_mean <= max_mark_mean
+                    and gap_12 >= min_gap_12
+                    and gap_median >= min_gap_median
+                )
+
+                # Guard riêng cho hàng cuối (digit 9) để giảm false positive do mép đen đáy phiếu
+                if (
+                    row11_guard
+                    and top_row == dg_rows - 1
+                    and is_mark
+                    and gap_12 < row11_min_gap_12
+                    and gap_median < row11_min_gap_median
+                ):
+                    is_mark = False
+
+                if is_mark and top_row < len(dg_labels):
+                    answer += dg_labels[top_row]
             else:
-                # Fallback: so sánh tương đối trên binary
-                ratios = []
-                for r in range(dg_rows):
-                    rect = get_bubble_rect(region, r, c, w, h, margin)
-                    ratio = compute_fill_ratio(binary, rect)
-                    ratios.append(ratio)
-                # Lọc nhiễu viền: bỏ qua bubble fill > 0.9 (viền form)
-                valid = [(r, v) for r, v in enumerate(ratios) if v < 0.9]
-                if len(valid) < 2:
+                top_row, top_fill, second_fill, median_fill = _dg_column_binary_stats(
+                    binary, region, c, w, h, margin
+                )
+                if top_row is None:
                     continue
-                valid_vals = [v for _, v in valid]
-                max_ratio = max(valid_vals)
-                max_row = [r for r, v in valid if v == max_ratio][0]
-                sorted_r = sorted(valid_vals, reverse=True)
-                second = sorted_r[1] if len(sorted_r) > 1 else 0
-                if max_ratio >= fill_threshold and second > 0 and max_ratio / second >= 1.5:
-                    if max_row < len(dg_labels):
-                        answer += dg_labels[max_row]
+
+                gap_fill = top_fill - second_fill
+                gap_fill_median = top_fill - median_fill
+                is_mark = (
+                    top_fill >= fill_threshold
+                    and top_fill <= max_fill_noise
+                    and gap_fill >= min_fill_gap
+                    and gap_fill_median >= min_fill_median_gap
+                )
+
+                if (
+                    row11_guard
+                    and top_row == dg_rows - 1
+                    and is_mark
+                    and gap_fill < (min_fill_gap * 1.8)
+                ):
+                    is_mark = False
+
+                if is_mark and top_row < len(dg_labels):
+                    answer += dg_labels[top_row]
 
         dg_result[str(q_num)] = answer
 
