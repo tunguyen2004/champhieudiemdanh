@@ -18,6 +18,127 @@ def load_config(config_path="config.json"):
         return json.load(f)
 
 
+def _rotate_input_image(img, rotation_deg):
+    if rotation_deg == 0:
+        return img
+    if rotation_deg == 90:
+        return cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
+    if rotation_deg == 180:
+        return cv2.rotate(img, cv2.ROTATE_180)
+    if rotation_deg == 270:
+        return cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    raise ValueError(f"Unsupported rotation: {rotation_deg}")
+
+
+def _score_output(output, config):
+    if output.get("res") is None:
+        return -1000
+
+    score = 0
+    sbd = str(output.get("sbd", ""))
+    mdt = str(output.get("mdt", ""))
+    sbd_expected = config["regions"]["sbd"]["cols"]
+    mdt_expected = config["regions"]["mdt"]["cols"]
+    fc = output.get("res", {}).get("fc", {})
+    tf = output.get("res", {}).get("tf", {})
+    dg = output.get("res", {}).get("dg", {})
+
+    sbd = sbd[:sbd_expected].ljust(sbd_expected, "?")
+    mdt = mdt[:mdt_expected].ljust(mdt_expected, "?")
+
+    score += sum(60 for ch in sbd if ch != "?")
+    score -= sum(80 for ch in sbd if ch == "?")
+    score += sum(60 for ch in mdt if ch != "?")
+    score -= sum(80 for ch in mdt if ch == "?")
+    score += sum(1 for ans in fc.values() if len(ans) == 1) * 2
+    score -= sum(1 for ans in fc.values() if len(ans) > 1) * 6
+
+    for question_data in tf.values():
+        if isinstance(question_data, dict):
+            score += sum(1 for ans in question_data.values() if len(ans) == 1)
+            score -= sum(2 for ans in question_data.values() if len(ans) > 1)
+
+    score += sum(len(value) for value in dg.values()) * 2
+    score -= len(output.get("err", [])) * 20
+
+    warn_text = output.get("warn", "")
+    if warn_text:
+        score -= len([item for item in warn_text.split(";") if item.strip()]) * 2
+
+    if "aligned" in output.get("_detection_method", ""):
+        score += 5
+
+    return score
+
+
+def _is_confident_output(output, config):
+    sbd_expected = config["regions"]["sbd"]["cols"]
+    mdt_expected = config["regions"]["mdt"]["cols"]
+    sbd = str(output.get("sbd", ""))
+    mdt = str(output.get("mdt", ""))
+    return (
+        len(sbd) >= sbd_expected
+        and len(mdt) >= mdt_expected
+        and "?" not in sbd[:sbd_expected]
+        and "?" not in mdt[:mdt_expected]
+    )
+
+
+def _process_loaded_image(img, image_path, config, debug=False, rotation_deg=0):
+    gray = preprocess(img, config)
+    binary = preprocess_to_binary(img, config)
+
+    corners, method = find_corners(img, binary, config)
+    warp_w = config.get("warp_width", 1800)
+    warp_h = config.get("warp_height", 2500)
+
+    warped = warp_perspective(img, corners, warp_w, warp_h)
+
+    warped, skew_angle = deskew(warped)
+    if abs(skew_angle) > 0.3:
+        warped = cv2.resize(warped, (warp_w, warp_h), interpolation=cv2.INTER_CUBIC)
+
+    warped, aligned = align_to_template(warped, config)
+    if aligned:
+        method += "+aligned"
+    if rotation_deg:
+        method += f"+rot{rotation_deg}"
+
+    warped_gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
+    clahe_e = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    enhanced_e = clahe_e.apply(warped_gray)
+    blurred_e = cv2.GaussianBlur(enhanced_e, (5, 5), 0)
+    _, warped_binary = cv2.threshold(
+        blurred_e, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
+    )
+
+    results, errors, warnings = extract_all(warped_binary, config, warped_gray)
+    marked = visualize_results(warped, results, config)
+
+    debug_img = None
+    if debug:
+        debug_img = create_debug_image(warped, warped_binary, config)
+
+    output = {
+        "org": image_path,
+        "out": "",
+        "warn": "; ".join(warnings) if warnings else "",
+        "err": errors,
+        "res": {
+            "fc": results["fc"],
+            "tf": results["tf"],
+            "dg": results["dg"]
+        },
+        "sbd": results["sbd"],
+        "mdt": results["mdt"],
+        "_detection_method": method,
+        "_skew_angle": round(skew_angle, 2),
+        "_rotation_deg": rotation_deg,
+    }
+
+    return output, marked, debug_img
+
+
 def process_image(image_path, config, debug=False):
     """
     Pipeline xử lý chính cho 1 ảnh phiếu trắc nghiệm.
@@ -35,6 +156,25 @@ def process_image(image_path, config, debug=False):
         img = load_image(image_path)
     except ValueError as e:
         return {"err": [str(e)], "res": None}, None, None
+
+    best_output, best_marked, best_debug = _process_loaded_image(
+        img, image_path, config, debug=debug, rotation_deg=0
+    )
+    if _is_confident_output(best_output, config):
+        return best_output, best_marked, best_debug
+
+    best_score = _score_output(best_output, config)
+    for rotation_deg in (90, 180, 270):
+        rotated_img = _rotate_input_image(img, rotation_deg)
+        output, marked, debug_img = _process_loaded_image(
+            rotated_img, image_path, config, debug=debug, rotation_deg=rotation_deg
+        )
+        score = _score_output(output, config)
+        if score > best_score:
+            best_output, best_marked, best_debug = output, marked, debug_img
+            best_score = score
+
+    return best_output, best_marked, best_debug
 
     # 2. Tiền xử lý
     gray = preprocess(img, config)

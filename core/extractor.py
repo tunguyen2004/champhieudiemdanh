@@ -509,6 +509,7 @@ def extract_sbd(binary, config, grayscale=None):
     region = auto_calibrate_grid_y(grayscale, region, h, w, margin)
 
     sbd = ""
+    marks = []
     for col in range(region["cols"]):
         if grayscale is not None:
             min_row, gap, _, _ = _id_column_stats(
@@ -516,14 +517,17 @@ def extract_sbd(binary, config, grayscale=None):
             )
             if gap > 10:
                 sbd += region["labels"][min_row]
+                marks.append(min_row)
             else:
                 recovered_row = _recover_id_digit_with_local_offset(
                     binary, grayscale, region, col, w, h, margin
                 )
                 if recovered_row is not None:
                     sbd += region["labels"][recovered_row]
+                    marks.append(recovered_row)
                 else:
                     sbd += "?"
+                    marks.append(None)
         else:
             ratios = []
             for row in range(region["rows"]):
@@ -535,9 +539,11 @@ def extract_sbd(binary, config, grayscale=None):
             second = sorted_r[1] if len(sorted_r) > 1 else 0
             if second > 0 and max_ratio / second >= 1.15:
                 sbd += region["labels"][max_row]
+                marks.append(max_row)
             else:
                 sbd += "?"
-    return sbd
+                marks.append(None)
+    return sbd, marks, region
 
 
 def extract_mdt(binary, config, grayscale=None):
@@ -550,6 +556,7 @@ def extract_mdt(binary, config, grayscale=None):
     region = auto_calibrate_grid_y(grayscale, region, h, w, margin)
 
     mdt = ""
+    marks = []
     for col in range(region["cols"]):
         if grayscale is not None:
             min_row, gap, _, _ = _id_column_stats(
@@ -557,14 +564,17 @@ def extract_mdt(binary, config, grayscale=None):
             )
             if gap > 10:
                 mdt += region["labels"][min_row]
+                marks.append(min_row)
             else:
                 recovered_row = _recover_id_digit_with_local_offset(
                     binary, grayscale, region, col, w, h, margin
                 )
                 if recovered_row is not None:
                     mdt += region["labels"][recovered_row]
+                    marks.append(recovered_row)
                 else:
                     mdt += "?"
+                    marks.append(None)
         else:
             ratios = []
             for row in range(region["rows"]):
@@ -576,9 +586,11 @@ def extract_mdt(binary, config, grayscale=None):
             second = sorted_r[1] if len(sorted_r) > 1 else 0
             if second > 0 and max_ratio / second >= 1.15:
                 mdt += region["labels"][max_row]
+                marks.append(max_row)
             else:
                 mdt += "?"
-    return mdt
+                marks.append(None)
+    return mdt, marks, region
 
 
 def extract_fc(binary, config, grayscale=None):
@@ -965,6 +977,7 @@ def extract_dg(binary, config, grayscale=None):
     h, w = binary.shape[:2]
 
     dg_result = {}
+    dg_marks = {}
     errors = []
     warnings = []
 
@@ -972,6 +985,7 @@ def extract_dg(binary, config, grayscale=None):
         q_num = group["question"]
         cols = group["cols"]
         answer = ""
+        column_marks = []
 
         region = {
             "x1": group["x1"], "y1": group["y1"],
@@ -985,6 +999,7 @@ def extract_dg(binary, config, grayscale=None):
                     grayscale, region, c, w, h, margin
                 )
                 if top_row is None:
+                    column_marks.append(None)
                     continue
 
                 gap_12 = second_mean - top_mean
@@ -1007,11 +1022,15 @@ def extract_dg(binary, config, grayscale=None):
 
                 if is_mark and top_row < len(dg_labels):
                     answer += dg_labels[top_row]
+                    column_marks.append(top_row)
+                else:
+                    column_marks.append(None)
             else:
                 top_row, top_fill, second_fill, median_fill = _dg_column_binary_stats(
                     binary, region, c, w, h, margin
                 )
                 if top_row is None:
+                    column_marks.append(None)
                     continue
 
                 gap_fill = top_fill - second_fill
@@ -1033,10 +1052,14 @@ def extract_dg(binary, config, grayscale=None):
 
                 if is_mark and top_row < len(dg_labels):
                     answer += dg_labels[top_row]
+                    column_marks.append(top_row)
+                else:
+                    column_marks.append(None)
 
         dg_result[str(q_num)] = answer
+        dg_marks[str(q_num)] = column_marks
 
-    return dg_result, errors, warnings
+    return dg_result, dg_marks, errors, warnings
 
 
 def extract_all(binary, config, grayscale=None):
@@ -1047,8 +1070,8 @@ def extract_all(binary, config, grayscale=None):
     all_errors = []
     all_warnings = []
 
-    sbd = extract_sbd(binary, config, grayscale)
-    mdt = extract_mdt(binary, config, grayscale)
+    sbd, sbd_marks, sbd_region = extract_sbd(binary, config, grayscale)
+    mdt, mdt_marks, mdt_region = extract_mdt(binary, config, grayscale)
 
     fc, fc_err, fc_warn = extract_fc(binary, config, grayscale)
     all_errors.extend(fc_err)
@@ -1058,7 +1081,7 @@ def extract_all(binary, config, grayscale=None):
     all_errors.extend(tf_err)
     all_warnings.extend(tf_warn)
 
-    dg, dg_err, dg_warn = extract_dg(binary, config, grayscale)
+    dg, dg_marks, dg_err, dg_warn = extract_dg(binary, config, grayscale)
     all_errors.extend(dg_err)
     all_warnings.extend(dg_warn)
 
@@ -1067,7 +1090,12 @@ def extract_all(binary, config, grayscale=None):
         "mdt": mdt,
         "fc": fc,
         "tf": tf,
-        "dg": dg
+        "dg": dg,
+        "_sbd_marks": sbd_marks,
+        "_mdt_marks": mdt_marks,
+        "_dg_marks": dg_marks,
+        "_sbd_region": dict(sbd_region),
+        "_mdt_region": dict(mdt_region),
     }
 
     return results, all_errors, all_warnings

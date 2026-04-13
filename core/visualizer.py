@@ -85,6 +85,39 @@ def _get_tf_filled(tf_data, group, group_index, row_index):
     return legacy_ans if isinstance(legacy_ans, list) else []
 
 
+def _row_marks_from_text(value, labels, cols):
+    marks = []
+    text = value if isinstance(value, str) else ""
+    for col in range(cols):
+        if col >= len(text):
+            marks.append(None)
+            continue
+        char = text[col]
+        try:
+            marks.append(labels.index(char))
+        except ValueError:
+            marks.append(None)
+    return marks
+
+
+def _draw_id_marks_grid(marked, overlay, region, margin, marks):
+    """Draw SBD/MDT from extracted marks instead of thresholding again."""
+    h, w = marked.shape[:2]
+    labels = region["labels"]
+    for col in range(region["cols"]):
+        selected_row = marks[col] if col < len(marks) else None
+        for row in range(region["rows"]):
+            rect = get_bubble_rect(region, row, col, w, h, margin)
+            x1, y1, x2, y2 = rect
+            if selected_row is not None and row == selected_row:
+                _mark_bubble(marked, overlay, rect, COLOR_FILLED)
+                digit = labels[row] if row < len(labels) else "?"
+                cv2.putText(marked, digit, (x1 + 2, y2 - 2),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, COLOR_FILLED, 1)
+            else:
+                cv2.rectangle(marked, (x1, y1), (x2, y2), COLOR_EMPTY, 1)
+
+
 def visualize_results(warped_img, results, config):
     """
     Vẽ toàn bộ kết quả nhận diện lên ảnh đã warp.
@@ -94,27 +127,23 @@ def visualize_results(warped_img, results, config):
     overlay = marked.copy()
     h, w = marked.shape[:2]
     margin = config.get("bubble_margin", 0.15)
-    fill_threshold = config.get("fill_threshold", 0.40)
     regions = config["regions"]
 
-    gray = cv2.cvtColor(marked, cv2.COLOR_BGR2GRAY)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    enhanced = clahe.apply(gray)
-    blurred = cv2.GaussianBlur(enhanced, (5, 5), 0)
-    binary = cv2.adaptiveThreshold(
-        blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY_INV, 11, 2
-    )
-
     # --- SBD ---
-    sbd_region = regions["sbd"]
+    sbd_region = results.get("_sbd_region", regions["sbd"])
     sbd_text = results.get("sbd", "")
-    _draw_id_grid(marked, overlay, binary, sbd_region, margin, fill_threshold)
+    sbd_marks = results.get("_sbd_marks") or _row_marks_from_text(
+        sbd_text, sbd_region["labels"], sbd_region["cols"]
+    )
+    _draw_id_marks_grid(marked, overlay, sbd_region, margin, sbd_marks)
 
     # --- MĐT ---
-    mdt_region = regions["mdt"]
+    mdt_region = results.get("_mdt_region", regions["mdt"])
     mdt_text = results.get("mdt", "")
-    _draw_id_grid(marked, overlay, binary, mdt_region, margin, fill_threshold)
+    mdt_marks = results.get("_mdt_marks") or _row_marks_from_text(
+        mdt_text, mdt_region["labels"], mdt_region["cols"]
+    )
+    _draw_id_marks_grid(marked, overlay, mdt_region, margin, mdt_marks)
 
     # --- FC (Phần I) ---
     fc_data = results.get("fc", {})
@@ -159,9 +188,12 @@ def visualize_results(warped_img, results, config):
 
     # --- DG (Phần III) ---
     dg_data = results.get("dg", {})
+    dg_marks = results.get("_dg_marks", {})
     dg_labels = regions["dg"]["labels"]
     dg_rows = regions["dg"]["rows"]
     for group in regions["dg"]["groups"]:
+        q_key = str(group["question"])
+        selected_rows = dg_marks.get(q_key, [])
         region = {
             "x1": group["x1"], "y1": group["y1"],
             "x2": group["x2"], "y2": group["y2"],
@@ -171,8 +203,8 @@ def visualize_results(warped_img, results, config):
             for c in range(group["cols"]):
                 rect = get_bubble_rect(region, r, c, w, h, margin)
                 x1_, y1_, x2_, y2_ = rect
-                ratio = compute_fill_ratio(binary, rect)
-                if ratio >= fill_threshold:
+                selected_row = selected_rows[c] if c < len(selected_rows) else None
+                if selected_row is not None and r == selected_row:
                     _mark_bubble(marked, overlay, rect, COLOR_FILLED)
                     label = dg_labels[r] if r < len(dg_labels) else str(r)
                     cv2.putText(marked, label, (x1_ + 2, y2_ - 2),
