@@ -10,6 +10,8 @@ Edge Cases được xử lý:
 """
 import cv2
 import numpy as np
+import copy
+from .mark_scorer import score_mark, choose_mark
 
 _TEMPLATE_GRAY_CACHE = {}
 
@@ -108,6 +110,179 @@ def compute_fill_ratio(binary, rect):
     if roi.size == 0:
         return 0.0
     return cv2.countNonZero(roi) / roi.size
+
+
+def _clamp_rect(rect, img_w, img_h):
+    """Clamp rect vào biên ảnh, bảo toàn tính hợp lệ."""
+    x1, y1, x2, y2 = rect
+    x1 = max(0, min(int(x1), img_w - 1))
+    y1 = max(0, min(int(y1), img_h - 1))
+    x2 = max(x1 + 1, min(int(x2), img_w))
+    y2 = max(y1 + 1, min(int(y2), img_h))
+    return x1, y1, x2, y2
+
+
+def _refine_bubble_rect(
+    binary, grayscale, rect, max_shift_ratio=0.20, shrink_ratio=0.92
+):
+    """
+    Tinh chỉnh tâm bubble cục bộ để giảm lệch ROI.
+    Dựa trên centroid của vùng tối/đã tô trong chính ô bubble.
+    """
+    x1, y1, x2, y2 = rect
+    if x2 - x1 < 6 or y2 - y1 < 6:
+        return rect
+
+    if grayscale is not None:
+        img_h, img_w = grayscale.shape[:2]
+        roi_gray = grayscale[y1:y2, x1:x2]
+        if roi_gray.size == 0:
+            return rect
+        roi_gray = cv2.GaussianBlur(roi_gray, (3, 3), 0)
+        min_side = max(min(roi_gray.shape[:2]), 5)
+        block = min(21, min_side if min_side % 2 == 1 else min_side - 1)
+        block = max(block, 5)
+        local = cv2.adaptiveThreshold(
+            roi_gray,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV,
+            block,
+            6
+        )
+    else:
+        img_h, img_w = binary.shape[:2]
+        roi_bin = binary[y1:y2, x1:x2]
+        if roi_bin.size == 0:
+            return rect
+        local = roi_bin.copy()
+
+    if binary is not None:
+        roi_bin = binary[y1:y2, x1:x2]
+        if roi_bin.size > 0:
+            local = cv2.bitwise_or(local, roi_bin)
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    local = cv2.morphologyEx(local, cv2.MORPH_OPEN, kernel, iterations=1)
+    if cv2.countNonZero(local) == 0:
+        return rect
+
+    moments = cv2.moments(local)
+    if moments["m00"] <= 1e-6:
+        return rect
+
+    cx = float(moments["m10"] / moments["m00"])
+    cy = float(moments["m01"] / moments["m00"])
+    roi_w = float(x2 - x1)
+    roi_h = float(y2 - y1)
+    base_cx = (roi_w - 1.0) / 2.0
+    base_cy = (roi_h - 1.0) / 2.0
+
+    max_shift_x = roi_w * max_shift_ratio
+    max_shift_y = roi_h * max_shift_ratio
+    shift_x = float(np.clip(cx - base_cx, -max_shift_x, max_shift_x))
+    shift_y = float(np.clip(cy - base_cy, -max_shift_y, max_shift_y))
+
+    new_w = max(int(round(roi_w * shrink_ratio)), 4)
+    new_h = max(int(round(roi_h * shrink_ratio)), 4)
+    new_cx = x1 + base_cx + shift_x
+    new_cy = y1 + base_cy + shift_y
+    nx1 = int(round(new_cx - new_w / 2.0))
+    ny1 = int(round(new_cy - new_h / 2.0))
+    nx2 = nx1 + new_w
+    ny2 = ny1 + new_h
+
+    return _clamp_rect((nx1, ny1, nx2, ny2), img_w, img_h)
+
+
+def _bubble_core_metrics(binary, grayscale, rect, core_ratio=0.62):
+    """
+    Đặc trưng bubble ở vùng lõi + vành để giảm nhiễu viền/in.
+    Returns:
+      core_fill, ring_fill, mean_intensity, full_fill
+    """
+    x1, y1, x2, y2 = rect
+    if x2 <= x1 or y2 <= y1:
+        return 0.0, 0.0, 255.0, 0.0
+
+    roi_bin = binary[y1:y2, x1:x2]
+    if roi_bin.size == 0:
+        return 0.0, 0.0, 255.0, 0.0
+
+    roi_h, roi_w = roi_bin.shape[:2]
+    mask = np.zeros((roi_h, roi_w), dtype=np.uint8)
+    center = (roi_w // 2, roi_h // 2)
+    axis_x = max(int((roi_w * core_ratio) / 2), 1)
+    axis_y = max(int((roi_h * core_ratio) / 2), 1)
+    cv2.ellipse(mask, center, (axis_x, axis_y), 0, 0, 360, 255, -1)
+
+    core_pixels = cv2.countNonZero(mask)
+    if core_pixels == 0:
+        return 0.0, 0.0, 255.0, 0.0
+
+    full_pixels = roi_bin.size
+    full_nonzero = cv2.countNonZero(roi_bin)
+    core_nonzero = cv2.countNonZero(cv2.bitwise_and(roi_bin, roi_bin, mask=mask))
+    ring_pixels = max(full_pixels - core_pixels, 1)
+    ring_nonzero = max(full_nonzero - core_nonzero, 0)
+
+    core_fill = core_nonzero / core_pixels
+    ring_fill = ring_nonzero / ring_pixels
+    full_fill = full_nonzero / full_pixels
+
+    if grayscale is None:
+        mean_intensity = 255.0 * (1.0 - core_fill)
+    else:
+        roi_gray = grayscale[y1:y2, x1:x2]
+        mean_intensity = cv2.mean(roi_gray, mask=mask)[0] if roi_gray.size > 0 else 255.0
+
+    return float(core_fill), float(ring_fill), float(mean_intensity), float(full_fill)
+
+
+def _score_bubble_mark(binary, grayscale, rect, core_ratio=0.62):
+    """
+    Unified bubble scoring using mark_scorer + core/ring metrics.
+    """
+    x1, y1, x2, y2 = rect
+    if x2 <= x1 or y2 <= y1:
+        return {
+            "score": 0.0,
+            "fill_ratio": 0.0,
+            "core_fill": 0.0,
+            "ring_noise": 0.0,
+            "ring_fill": 0.0,
+            "darkness": 0.0,
+            "mean_intensity": 255.0,
+            "full_fill": 0.0,
+        }
+
+    roi_bin = binary[y1:y2, x1:x2]
+    roi_gray = grayscale[y1:y2, x1:x2] if grayscale is not None else None
+    if roi_bin.size == 0:
+        return {
+            "score": 0.0,
+            "fill_ratio": 0.0,
+            "core_fill": 0.0,
+            "ring_noise": 0.0,
+            "ring_fill": 0.0,
+            "darkness": 0.0,
+            "mean_intensity": 255.0,
+            "full_fill": 0.0,
+        }
+
+    score_payload = score_mark(roi_bin, roi_gray)
+    core_fill, ring_fill, mean_intensity, full_fill = _bubble_core_metrics(
+        binary,
+        grayscale,
+        rect,
+        core_ratio=core_ratio
+    )
+
+    score_payload["core_fill"] = float(core_fill)
+    score_payload["ring_fill"] = float(ring_fill)
+    score_payload["mean_intensity"] = float(mean_intensity)
+    score_payload["full_fill"] = float(full_fill)
+    return score_payload
 
 
 # ============================================================
@@ -652,35 +827,13 @@ def _tf_core_metrics(binary, grayscale, rect, core_ratio=0.62):
     - core_fill: fill_ratio trong vùng ellipse trung tâm
     - mean_intensity: cường độ xám trung bình trong vùng lõi
     """
-    x1, y1, x2, y2 = rect
-    if x2 <= x1 or y2 <= y1:
-        return 0.0, 255.0
-
-    roi_bin = binary[y1:y2, x1:x2]
-    if roi_bin.size == 0:
-        return 0.0, 255.0
-
-    roi_h, roi_w = roi_bin.shape[:2]
-    mask = np.zeros((roi_h, roi_w), dtype=np.uint8)
-    center = (roi_w // 2, roi_h // 2)
-    axis_x = max(int((roi_w * core_ratio) / 2), 1)
-    axis_y = max(int((roi_h * core_ratio) / 2), 1)
-    cv2.ellipse(mask, center, (axis_x, axis_y), 0, 0, 360, 255, -1)
-
-    mask_pixels = cv2.countNonZero(mask)
-    if mask_pixels == 0:
-        return 0.0, 255.0
-
-    masked_bin = cv2.bitwise_and(roi_bin, roi_bin, mask=mask)
-    core_fill = cv2.countNonZero(masked_bin) / mask_pixels
-
-    if grayscale is None:
-        mean_intensity = 255.0 * (1.0 - core_fill)
-    else:
-        roi_gray = grayscale[y1:y2, x1:x2]
-        mean_intensity = cv2.mean(roi_gray, mask=mask)[0] if roi_gray.size > 0 else 255.0
-
-    return float(core_fill), float(mean_intensity)
+    core_fill, ring_fill, mean_intensity, _ = _bubble_core_metrics(
+        binary,
+        grayscale,
+        rect,
+        core_ratio=core_ratio
+    )
+    return core_fill, ring_fill, mean_intensity
 
 
 def _get_warped_template_gray(config, target_w, target_h):
@@ -767,6 +920,7 @@ def extract_tf(binary, config, grayscale=None):
     weight_fill = tf_det_cfg.get("signal_weight_fill", 0.7)
     weight_darkness = tf_det_cfg.get("signal_weight_darkness", 0.3)
     weight_template = tf_det_cfg.get("signal_weight_template", 0.6)
+    weight_ring_penalty = tf_det_cfg.get("signal_weight_ring_penalty", 0.28)
     min_signal = tf_det_cfg.get("min_signal", 0.24)
     min_signal_diff = tf_det_cfg.get("min_signal_diff", 0.08)
     min_fill_ratio = tf_det_cfg.get("min_fill_ratio", 1.20)
@@ -777,7 +931,11 @@ def extract_tf(binary, config, grayscale=None):
     ambiguous_signal_diff = tf_det_cfg.get("ambiguous_signal_diff", 0.02)
     min_template_delta = tf_det_cfg.get("min_template_delta", 0.11)
     min_template_diff = tf_det_cfg.get("min_template_diff", 0.02)
+    min_core_vs_ring = tf_det_cfg.get("min_core_vs_ring", 1.02)
     auto_calibrate_tf = tf_det_cfg.get("auto_calibrate_y", False)
+    refine_center = tf_det_cfg.get("refine_center", True)
+    refine_max_shift_ratio = tf_det_cfg.get("refine_max_shift_ratio", 0.22)
+    refine_shrink_ratio = tf_det_cfg.get("refine_shrink_ratio", 0.92)
 
     h, w = binary.shape[:2]
     sub_labels = ["a", "b", "c", "d"]
@@ -804,24 +962,36 @@ def extract_tf(binary, config, grayscale=None):
             bubble_metrics = []
 
             for col_idx in range(group["cols"]):
-                rect = get_bubble_rect(group, row_idx, col_idx, w, h, margin)
+                base_rect = get_bubble_rect(group, row_idx, col_idx, w, h, margin)
+                rect = base_rect
+                if refine_center and grayscale is not None:
+                    rect = _refine_bubble_rect(
+                        binary,
+                        grayscale,
+                        base_rect,
+                        max_shift_ratio=refine_max_shift_ratio,
+                        shrink_ratio=refine_shrink_ratio
+                    )
                 if grayscale is not None:
-                    core_fill, mean_intensity = _tf_core_metrics(
+                    core_fill, ring_fill, mean_intensity = _tf_core_metrics(
                         binary, grayscale, rect, core_ratio=core_ratio
                     )
                     darkness = (255.0 - mean_intensity) / 255.0
                     template_delta = _tf_template_delta(
                         grayscale, template_gray, rect, core_ratio=core_ratio
                     )
+                    ring_noise = max(0.0, ring_fill - (core_fill * 0.60))
                     signal = (
                         weight_fill * core_fill
                         + weight_darkness * darkness
                         + weight_template * template_delta
+                        - weight_ring_penalty * ring_noise
                     )
                     bubble_metrics.append({
                         "col": col_idx,
                         "status": "core",
                         "fill": core_fill,
+                        "ring_fill": ring_fill,
                         "signal": signal,
                         "template_delta": template_delta
                     })
@@ -831,6 +1001,7 @@ def extract_tf(binary, config, grayscale=None):
                         "col": col_idx,
                         "status": status,
                         "fill": robust_fill,
+                        "ring_fill": 0.0,
                         "signal": robust_fill,
                         "template_delta": 0.0
                     })
@@ -850,6 +1021,7 @@ def extract_tf(binary, config, grayscale=None):
                 top_strong = top["fill"] >= strong_fill and top["signal"] >= min_signal
                 top_weak = top["fill"] >= weak_fill and top["signal"] >= min_signal
                 alt_low = alt["fill"] <= max_alt_fill
+                top_core_dominant = top["fill"] >= (top["ring_fill"] * min_core_vs_ring)
                 template_diff = top["template_delta"] - alt["template_delta"]
                 template_confident = (
                     top["template_delta"] >= min_template_delta
@@ -865,11 +1037,17 @@ def extract_tf(binary, config, grayscale=None):
                     warnings.append(
                         f"TF câu {question_key} ý {sub_key}: Mơ hồ Đ/S (cả 2 cột đều mạnh)"
                     )
-                elif template_confident:
+                elif template_confident and top_core_dominant:
                     filled = [top["col"]]
-                elif top_strong and (alt_low or fill_ratio >= min_fill_ratio or signal_diff >= min_signal_diff):
+                elif (
+                    top_strong and top_core_dominant
+                    and (alt_low or fill_ratio >= min_fill_ratio or signal_diff >= min_signal_diff)
+                ):
                     filled = [top["col"]]
-                elif top_weak and signal_diff >= min_signal_diff and fill_ratio >= min_fill_ratio:
+                elif (
+                    top_weak and top_core_dominant
+                    and signal_diff >= min_signal_diff and fill_ratio >= min_fill_ratio
+                ):
                     filled = [top["col"]]
                 else:
                     filled = []
@@ -895,10 +1073,14 @@ def extract_tf(binary, config, grayscale=None):
 
         tf_result[question_key] = question_result
 
-    return tf_result, errors, warnings
+    return tf_result, calibrated_groups, errors, warnings
 
 
-def _dg_column_gray_stats(grayscale, region, col, img_w, img_h, margin=0.15):
+def _dg_column_gray_stats(
+    binary, grayscale, region, col, img_w, img_h, margin=0.15,
+    core_ratio=0.64, refine_center=True, refine_max_shift_ratio=0.22,
+    refine_shrink_ratio=0.92
+):
     """
     Thống kê 1 cột DG trên ảnh xám:
     - top_row: hàng tối nhất
@@ -907,26 +1089,48 @@ def _dg_column_gray_stats(grayscale, region, col, img_w, img_h, margin=0.15):
     - median_mean: trung vị intensity toàn cột
     """
     means = []
+    fills = []
+    ring_fills = []
     rows = region["rows"]
     for row in range(rows):
-        rect = get_bubble_rect(region, row, col, img_w, img_h, margin)
-        x1, y1, x2, y2 = rect
-        roi = grayscale[y1:y2, x1:x2]
-        mean_val = float(np.mean(roi)) if roi.size > 0 else 255.0
+        base_rect = get_bubble_rect(region, row, col, img_w, img_h, margin)
+        rect = base_rect
+        if refine_center:
+            rect = _refine_bubble_rect(
+                binary,
+                grayscale,
+                base_rect,
+                max_shift_ratio=refine_max_shift_ratio,
+                shrink_ratio=refine_shrink_ratio
+            )
+        core_fill, ring_fill, mean_val, _ = _bubble_core_metrics(
+            binary,
+            grayscale,
+            rect,
+            core_ratio=core_ratio
+        )
         means.append(mean_val)
+        fills.append(core_fill)
+        ring_fills.append(ring_fill)
 
     if not means:
-        return None, 255.0, 255.0, 255.0
+        return None, 255.0, 255.0, 255.0, 0.0, 0.0
 
     order = sorted(range(len(means)), key=lambda idx: means[idx])
     top_row = int(order[0])
     top_mean = float(means[top_row])
     second_mean = float(means[order[1]]) if len(order) > 1 else 255.0
     median_mean = float(np.median(means))
-    return top_row, top_mean, second_mean, median_mean
+    top_fill = float(fills[top_row])
+    top_ring_fill = float(ring_fills[top_row])
+    return top_row, top_mean, second_mean, median_mean, top_fill, top_ring_fill
 
 
-def _dg_column_binary_stats(binary, region, col, img_w, img_h, margin=0.15):
+def _dg_column_binary_stats(
+    binary, grayscale, region, col, img_w, img_h, margin=0.15,
+    core_ratio=0.64, refine_center=False, refine_max_shift_ratio=0.22,
+    refine_shrink_ratio=0.92
+):
     """
     Thống kê 1 cột DG trên binary:
     - top_row: hàng fill ratio cao nhất
@@ -935,21 +1139,38 @@ def _dg_column_binary_stats(binary, region, col, img_w, img_h, margin=0.15):
     - median_fill: trung vị fill ratio toàn cột
     """
     fills = []
+    ring_fills = []
     rows = region["rows"]
     for row in range(rows):
-        rect = get_bubble_rect(region, row, col, img_w, img_h, margin)
-        fill = compute_fill_ratio(binary, rect)
-        fills.append(float(fill))
+        base_rect = get_bubble_rect(region, row, col, img_w, img_h, margin)
+        rect = base_rect
+        if refine_center and grayscale is not None:
+            rect = _refine_bubble_rect(
+                binary,
+                grayscale,
+                base_rect,
+                max_shift_ratio=refine_max_shift_ratio,
+                shrink_ratio=refine_shrink_ratio
+            )
+        core_fill, ring_fill, _, _ = _bubble_core_metrics(
+            binary,
+            grayscale,
+            rect,
+            core_ratio=core_ratio
+        )
+        fills.append(float(core_fill))
+        ring_fills.append(float(ring_fill))
 
     if not fills:
-        return None, 0.0, 0.0, 0.0
+        return None, 0.0, 0.0, 0.0, 0.0
 
     order = sorted(range(len(fills)), key=lambda idx: fills[idx], reverse=True)
     top_row = int(order[0])
     top_fill = float(fills[top_row])
     second_fill = float(fills[order[1]]) if len(order) > 1 else 0.0
     median_fill = float(np.median(fills))
-    return top_row, top_fill, second_fill, median_fill
+    top_ring_fill = float(ring_fills[top_row])
+    return top_row, top_fill, second_fill, median_fill, top_ring_fill
 
 
 def extract_dg(binary, config, grayscale=None):
@@ -974,10 +1195,17 @@ def extract_dg(binary, config, grayscale=None):
     min_fill_gap = dg_det_cfg.get("min_fill_gap", 0.05)
     min_fill_median_gap = dg_det_cfg.get("min_fill_median_gap", 0.08)
     max_fill_noise = dg_det_cfg.get("max_fill_noise", 0.90)
+    core_ratio = dg_det_cfg.get("core_ratio", 0.64)
+    refine_center = dg_det_cfg.get("refine_center", True)
+    refine_max_shift_ratio = dg_det_cfg.get("refine_max_shift_ratio", 0.22)
+    refine_shrink_ratio = dg_det_cfg.get("refine_shrink_ratio", 0.92)
+    min_core_fill = dg_det_cfg.get("min_core_fill", 0.12)
+    min_core_vs_ring = dg_det_cfg.get("min_core_vs_ring", 0.95)
     h, w = binary.shape[:2]
 
     dg_result = {}
     dg_marks = {}
+    dg_regions = {}
     errors = []
     warnings = []
 
@@ -995,8 +1223,18 @@ def extract_dg(binary, config, grayscale=None):
 
         for c in range(cols):
             if grayscale is not None:
-                top_row, top_mean, second_mean, median_mean = _dg_column_gray_stats(
-                    grayscale, region, c, w, h, margin
+                top_row, top_mean, second_mean, median_mean, top_fill, top_ring_fill = _dg_column_gray_stats(
+                    binary,
+                    grayscale,
+                    region,
+                    c,
+                    w,
+                    h,
+                    margin,
+                    core_ratio=core_ratio,
+                    refine_center=refine_center,
+                    refine_max_shift_ratio=refine_max_shift_ratio,
+                    refine_shrink_ratio=refine_shrink_ratio
                 )
                 if top_row is None:
                     column_marks.append(None)
@@ -1004,10 +1242,13 @@ def extract_dg(binary, config, grayscale=None):
 
                 gap_12 = second_mean - top_mean
                 gap_median = median_mean - top_mean
+                core_dominant = top_fill >= (top_ring_fill * min_core_vs_ring)
                 is_mark = (
                     top_mean <= max_mark_mean
                     and gap_12 >= min_gap_12
                     and gap_median >= min_gap_median
+                    and top_fill >= min_core_fill
+                    and core_dominant
                 )
 
                 # Guard riêng cho hàng cuối (digit 9) để giảm false positive do mép đen đáy phiếu
@@ -1026,8 +1267,18 @@ def extract_dg(binary, config, grayscale=None):
                 else:
                     column_marks.append(None)
             else:
-                top_row, top_fill, second_fill, median_fill = _dg_column_binary_stats(
-                    binary, region, c, w, h, margin
+                top_row, top_fill, second_fill, median_fill, top_ring_fill = _dg_column_binary_stats(
+                    binary,
+                    grayscale,
+                    region,
+                    c,
+                    w,
+                    h,
+                    margin,
+                    core_ratio=core_ratio,
+                    refine_center=refine_center,
+                    refine_max_shift_ratio=refine_max_shift_ratio,
+                    refine_shrink_ratio=refine_shrink_ratio
                 )
                 if top_row is None:
                     column_marks.append(None)
@@ -1035,11 +1286,13 @@ def extract_dg(binary, config, grayscale=None):
 
                 gap_fill = top_fill - second_fill
                 gap_fill_median = top_fill - median_fill
+                core_dominant = top_fill >= (top_ring_fill * min_core_vs_ring)
                 is_mark = (
                     top_fill >= fill_threshold
                     and top_fill <= max_fill_noise
                     and gap_fill >= min_fill_gap
                     and gap_fill_median >= min_fill_median_gap
+                    and core_dominant
                 )
 
                 if (
@@ -1058,11 +1311,302 @@ def extract_dg(binary, config, grayscale=None):
 
         dg_result[str(q_num)] = answer
         dg_marks[str(q_num)] = column_marks
+        dg_regions[str(q_num)] = dict(region)
 
-    return dg_result, dg_marks, errors, warnings
+    return dg_result, dg_marks, dg_regions, errors, warnings
 
 
-def extract_all(binary, config, grayscale=None):
+def extract_tf_mark_scorer(binary, config, grayscale=None):
+    """
+    TF extraction using mark_scorer directly with normalized confidence
+    per sub-question (row with 2 options).
+    """
+    tf_config = config["regions"]["tf"]
+    tf_det_cfg = config.get("tf_detection", {})
+    margin = config.get("tf_bubble_margin", config.get("bubble_margin", 0.15))
+    core_ratio = tf_det_cfg.get("core_ratio", 0.62)
+    auto_calibrate_tf = tf_det_cfg.get("auto_calibrate_y", False)
+    refine_center = tf_det_cfg.get("refine_center", True)
+    refine_max_shift_ratio = tf_det_cfg.get("refine_max_shift_ratio", 0.22)
+    refine_shrink_ratio = tf_det_cfg.get("refine_shrink_ratio", 0.92)
+
+    mark_min_conf = tf_det_cfg.get("mark_min_confidence", 0.56)
+    mark_min_gap = tf_det_cfg.get("mark_min_confidence_gap", 0.08)
+    mark_multi_delta = tf_det_cfg.get("mark_multi_delta", 0.04)
+    mark_temperature = tf_det_cfg.get("mark_temperature", 1.0)
+    min_core_fill = tf_det_cfg.get("mark_min_core_fill", 0.12)
+    max_ring_noise = tf_det_cfg.get("mark_max_ring_noise", 0.52)
+    min_core_vs_ring = tf_det_cfg.get("min_core_vs_ring", 1.02)
+    template_score_boost = tf_det_cfg.get("template_score_boost", 0.0)
+    template_min_for_pick = tf_det_cfg.get("template_min_for_pick", 0.0)
+
+    h, w = binary.shape[:2]
+    sub_labels = ["a", "b", "c", "d"]
+    template_gray = _get_warped_template_gray(config, w, h) if grayscale is not None else None
+
+    calibrated_groups = []
+    for group in tf_config["groups"]:
+        if auto_calibrate_tf:
+            cal_group = auto_calibrate_grid_y(grayscale, group, h, w, margin)
+        else:
+            cal_group = dict(group)
+        calibrated_groups.append(cal_group)
+
+    tf_result = {}
+    tf_confidence = {}
+    errors = []
+    warnings = []
+
+    for group_idx, group in enumerate(calibrated_groups, start=1):
+        question_key = _tf_question_key(group, group_idx)
+        question_result = {}
+        question_conf = {}
+
+        for row_idx in range(min(group["rows"], len(sub_labels))):
+            sub_key = sub_labels[row_idx]
+            option_scores = []
+
+            for col_idx in range(group["cols"]):
+                base_rect = get_bubble_rect(group, row_idx, col_idx, w, h, margin)
+                rect = base_rect
+                if refine_center and grayscale is not None:
+                    rect = _refine_bubble_rect(
+                        binary,
+                        grayscale,
+                        base_rect,
+                        max_shift_ratio=refine_max_shift_ratio,
+                        shrink_ratio=refine_shrink_ratio
+                    )
+
+                score_payload = _score_bubble_mark(
+                    binary,
+                    grayscale,
+                    rect,
+                    core_ratio=core_ratio
+                )
+                template_delta = _tf_template_delta(
+                    grayscale, template_gray, rect, core_ratio=core_ratio
+                ) if grayscale is not None else 0.0
+                score_payload["template_delta"] = float(template_delta)
+                score_payload["score"] = float(
+                    score_payload["score"] + (template_score_boost * template_delta)
+                )
+                score_payload["col"] = int(col_idx)
+                option_scores.append(score_payload)
+
+            if not option_scores:
+                question_result[sub_key] = []
+                question_conf[sub_key] = 0.0
+                continue
+
+            picked, confidence = choose_mark(
+                option_scores,
+                min_score=mark_min_conf,
+                min_gap=mark_min_gap,
+                normalize=True,
+                temperature=mark_temperature,
+                multi_delta=mark_multi_delta
+            )
+            question_conf[sub_key] = float(confidence)
+
+            selected = []
+            if len(picked) == 1:
+                top = option_scores[picked[0]]
+                core_dominant = top["core_fill"] >= (top["ring_fill"] * min_core_vs_ring)
+                pass_template = (
+                    top["template_delta"] >= template_min_for_pick
+                    if template_min_for_pick > 0
+                    else True
+                )
+                is_mark = (
+                    top["core_fill"] >= min_core_fill
+                    and top["ring_noise"] <= max_ring_noise
+                    and core_dominant
+                    and pass_template
+                )
+                if is_mark:
+                    selected = [int(top["col"])]
+            elif len(picked) > 1:
+                warnings.append(
+                    f"TF cau {question_key} y {sub_key}: mo ho D/S (confidence={confidence:.2f})"
+                )
+
+            question_result[sub_key] = selected
+
+        for missing_idx in range(len(question_result), len(sub_labels)):
+            question_result[sub_labels[missing_idx]] = []
+            question_conf[sub_labels[missing_idx]] = 0.0
+
+        tf_result[question_key] = question_result
+        tf_confidence[question_key] = question_conf
+
+    return tf_result, calibrated_groups, tf_confidence, errors, warnings
+
+
+def extract_dg_mark_scorer(binary, config, grayscale=None):
+    """
+    DG extraction using mark_scorer directly with normalized confidence
+    per digit-column.
+    """
+    dg_config = config["regions"]["dg"]
+    dg_labels = dg_config["labels"]
+    dg_rows = dg_config["rows"]
+    dg_det_cfg = config.get("dg_detection", {})
+    margin = config.get("dg_bubble_margin", config.get("bubble_margin", 0.15))
+
+    fill_threshold = dg_det_cfg.get("mark_min_fill_ratio", config.get("fill_threshold", 0.40))
+    max_fill_noise = dg_det_cfg.get("max_fill_noise", 0.90)
+    min_core_fill = dg_det_cfg.get("min_core_fill", 0.12)
+    min_core_vs_ring = dg_det_cfg.get("min_core_vs_ring", 0.95)
+    max_ring_noise = dg_det_cfg.get("mark_max_ring_noise", 0.58)
+    max_mark_mean = dg_det_cfg.get("max_mark_mean", 248.0)
+
+    mark_min_conf = dg_det_cfg.get("mark_min_confidence", 0.10)
+    mark_min_gap = dg_det_cfg.get("mark_min_confidence_gap", 0.008)
+    mark_multi_delta = dg_det_cfg.get("mark_multi_delta", 0.006)
+    mark_temperature = dg_det_cfg.get("mark_temperature", 1.0)
+
+    row11_guard = dg_det_cfg.get("row11_guard", True)
+    row11_min_conf = dg_det_cfg.get("row11_min_confidence", 0.12)
+    core_ratio = dg_det_cfg.get("core_ratio", 0.64)
+    refine_center = dg_det_cfg.get("refine_center", True)
+    refine_max_shift_ratio = dg_det_cfg.get("refine_max_shift_ratio", 0.22)
+    refine_shrink_ratio = dg_det_cfg.get("refine_shrink_ratio", 0.92)
+
+    h, w = binary.shape[:2]
+    dg_result = {}
+    dg_marks = {}
+    dg_regions = {}
+    dg_confidence = {}
+    errors = []
+    warnings = []
+
+    for group in dg_config["groups"]:
+        q_num = group["question"]
+        cols = group["cols"]
+        answer = ""
+        column_marks = []
+        column_conf = []
+
+        region = {
+            "x1": group["x1"], "y1": group["y1"],
+            "x2": group["x2"], "y2": group["y2"],
+            "rows": dg_rows, "cols": cols
+        }
+
+        for col_idx in range(cols):
+            row_scores = []
+            for row_idx in range(dg_rows):
+                base_rect = get_bubble_rect(region, row_idx, col_idx, w, h, margin)
+                rect = base_rect
+                if refine_center and grayscale is not None:
+                    rect = _refine_bubble_rect(
+                        binary,
+                        grayscale,
+                        base_rect,
+                        max_shift_ratio=refine_max_shift_ratio,
+                        shrink_ratio=refine_shrink_ratio
+                    )
+
+                score_payload = _score_bubble_mark(
+                    binary,
+                    grayscale,
+                    rect,
+                    core_ratio=core_ratio
+                )
+                score_payload["row"] = int(row_idx)
+                row_scores.append(score_payload)
+
+            if not row_scores:
+                column_marks.append(None)
+                column_conf.append(0.0)
+                continue
+
+            picked, confidence = choose_mark(
+                row_scores,
+                min_score=mark_min_conf,
+                min_gap=mark_min_gap,
+                normalize=True,
+                temperature=mark_temperature,
+                multi_delta=mark_multi_delta
+            )
+            column_conf.append(float(confidence))
+
+            mark_row = None
+            if len(picked) == 1:
+                top = row_scores[picked[0]]
+                core_dominant = top["core_fill"] >= (top["ring_fill"] * min_core_vs_ring)
+                gray_guard = (top["mean_intensity"] <= max_mark_mean) if grayscale is not None else True
+                is_mark = (
+                    top["fill_ratio"] >= fill_threshold
+                    and top["fill_ratio"] <= max_fill_noise
+                    and top["core_fill"] >= min_core_fill
+                    and top["ring_noise"] <= max_ring_noise
+                    and core_dominant
+                    and gray_guard
+                )
+
+                if (
+                    row11_guard
+                    and int(top["row"]) == dg_rows - 1
+                    and is_mark
+                    and confidence < row11_min_conf
+                ):
+                    is_mark = False
+
+                if is_mark:
+                    mark_row = int(top["row"])
+            elif len(picked) > 1:
+                warnings.append(
+                    f"DG cau {q_num} cot {col_idx + 1}: mo ho nhieu hang (confidence={confidence:.2f})"
+                )
+
+            if mark_row is not None and mark_row < len(dg_labels):
+                answer += dg_labels[mark_row]
+                column_marks.append(mark_row)
+            else:
+                column_marks.append(None)
+
+        dg_result[str(q_num)] = answer
+        dg_marks[str(q_num)] = column_marks
+        dg_regions[str(q_num)] = dict(region)
+        dg_confidence[str(q_num)] = column_conf
+
+    return dg_result, dg_marks, dg_regions, dg_confidence, errors, warnings
+
+
+def _merge_layout_regions(config, layout_regions):
+    """Merge dynamic layout regions into runtime config (fallback-safe)."""
+    merged = copy.deepcopy(config)
+    if not isinstance(layout_regions, dict):
+        return merged
+
+    merged_regions = merged.get("regions", {})
+
+    for key in ("sbd", "mdt"):
+        override = layout_regions.get(key)
+        if isinstance(override, dict):
+            base = dict(merged_regions.get(key, {}))
+            base.update(override)
+            merged_regions[key] = base
+
+    for key in ("fc", "tf", "dg"):
+        override = layout_regions.get(key)
+        if isinstance(override, dict):
+            base = dict(merged_regions.get(key, {}))
+            if isinstance(base.get("groups"), list) and isinstance(override.get("groups"), list):
+                base["groups"] = override["groups"]
+            if "rows" in override:
+                base["rows"] = override["rows"]
+            if "labels" in override:
+                base["labels"] = override["labels"]
+            merged_regions[key] = base
+
+    merged["regions"] = merged_regions
+    return merged
+
+
+def extract_all(binary, config, grayscale=None, layout_regions=None):
     """
     Trích xuất toàn bộ đáp án từ ảnh đã warp.
     Trả về (results_dict, errors_list, warnings_list).
@@ -1070,18 +1614,28 @@ def extract_all(binary, config, grayscale=None):
     all_errors = []
     all_warnings = []
 
-    sbd, sbd_marks, sbd_region = extract_sbd(binary, config, grayscale)
-    mdt, mdt_marks, mdt_region = extract_mdt(binary, config, grayscale)
+    runtime_config = _merge_layout_regions(config, layout_regions)
 
-    fc, fc_err, fc_warn = extract_fc(binary, config, grayscale)
+    sbd, sbd_marks, sbd_region = extract_sbd(binary, runtime_config, grayscale)
+    mdt, mdt_marks, mdt_region = extract_mdt(binary, runtime_config, grayscale)
+
+    fc, fc_err, fc_warn = extract_fc(binary, runtime_config, grayscale)
     all_errors.extend(fc_err)
     all_warnings.extend(fc_warn)
 
-    tf, tf_err, tf_warn = extract_tf(binary, config, grayscale)
+    tf, tf_groups, tf_confidence, tf_err, tf_warn = extract_tf_mark_scorer(
+        binary,
+        runtime_config,
+        grayscale
+    )
     all_errors.extend(tf_err)
     all_warnings.extend(tf_warn)
 
-    dg, dg_marks, dg_err, dg_warn = extract_dg(binary, config, grayscale)
+    dg, dg_marks, dg_regions, dg_confidence, dg_err, dg_warn = extract_dg_mark_scorer(
+        binary,
+        runtime_config,
+        grayscale
+    )
     all_errors.extend(dg_err)
     all_warnings.extend(dg_warn)
 
@@ -1091,9 +1645,14 @@ def extract_all(binary, config, grayscale=None):
         "fc": fc,
         "tf": tf,
         "dg": dg,
+        "_fc_groups": [dict(group) for group in runtime_config["regions"]["fc"]["groups"]],
         "_sbd_marks": sbd_marks,
         "_mdt_marks": mdt_marks,
         "_dg_marks": dg_marks,
+        "_tf_confidence": tf_confidence,
+        "_dg_confidence": dg_confidence,
+        "_tf_groups": [dict(group) for group in tf_groups],
+        "_dg_regions": {key: dict(val) for key, val in dg_regions.items()},
         "_sbd_region": dict(sbd_region),
         "_mdt_region": dict(mdt_region),
     }

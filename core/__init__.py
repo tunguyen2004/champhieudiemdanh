@@ -6,10 +6,11 @@ import json
 import os
 import numpy as np
 
-from .preprocessor import preprocess, preprocess_to_binary, load_image
+from .preprocessor import preprocess_to_binary, load_image
 from .detector import find_corners, warp_perspective, deskew, align_to_template
 from .extractor import extract_all
-from .visualizer import visualize_results, create_debug_image
+from .visualizer import create_debug_image, create_mark_layer
+from .layout_dynamic import analyze_layout
 
 
 def load_config(config_path="config.json"):
@@ -28,6 +29,63 @@ def _rotate_input_image(img, rotation_deg):
     if rotation_deg == 270:
         return cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
     raise ValueError(f"Unsupported rotation: {rotation_deg}")
+
+
+def _undo_input_rotation(img, rotation_deg):
+    """Undo discrete 90Â° rotation so output keeps original input orientation."""
+    if rotation_deg == 0:
+        return img
+    if rotation_deg == 90:
+        return cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    if rotation_deg == 180:
+        return cv2.rotate(img, cv2.ROTATE_180)
+    if rotation_deg == 270:
+        return cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
+    raise ValueError(f"Unsupported rotation: {rotation_deg}")
+
+
+def _compose_homography(*matrices):
+    """Compose source->dest transforms as Hn * ... * H2 * H1."""
+    h_total = np.eye(3, dtype=np.float32)
+    for mat in matrices:
+        if mat is None:
+            continue
+        h_total = mat.astype(np.float32) @ h_total
+    return h_total
+
+
+def _project_marks_to_input(input_img, mark_layer, forward_h):
+    """
+    Project mark layer from aligned space back to input image coordinates.
+    `forward_h` maps input -> aligned.
+    """
+    if mark_layer is None:
+        return input_img.copy()
+
+    h_img, w_img = input_img.shape[:2]
+    try:
+        inverse_h = np.linalg.inv(forward_h.astype(np.float64)).astype(np.float32)
+    except np.linalg.LinAlgError:
+        return input_img.copy()
+
+    projected = cv2.warpPerspective(
+        mark_layer,
+        inverse_h,
+        (w_img, h_img),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(0, 0, 0)
+    )
+
+    mask = cv2.cvtColor(projected, cv2.COLOR_BGR2GRAY)
+    if cv2.countNonZero(mask) == 0:
+        return input_img.copy()
+
+    blended = input_img.copy()
+    blended_mix = cv2.addWeighted(input_img, 0.55, projected, 0.95, 0)
+    use = mask > 0
+    blended[use] = blended_mix[use]
+    return blended
 
 
 def _score_output(output, config):
@@ -63,7 +121,17 @@ def _score_output(output, config):
 
     warn_text = output.get("warn", "")
     if warn_text:
-        score -= len([item for item in warn_text.split(";") if item.strip()]) * 2
+        warn_items = [item.strip() for item in warn_text.split(";") if item.strip()]
+        non_dynamic_warn = [
+            item for item in warn_items if not item.lower().startswith("dynamic layout")
+        ]
+        score -= len(non_dynamic_warn) * 2
+
+    if output.get("_layout_dynamic"):
+        score += 6
+        resolved_sections = output.get("_layout_resolved_sections", [])
+        if isinstance(resolved_sections, list):
+            score += len(resolved_sections) * 2
 
     if "aligned" in output.get("_detection_method", ""):
         score += 5
@@ -84,25 +152,72 @@ def _is_confident_output(output, config):
     )
 
 
+def _extraction_quality(results, errors, warnings, config):
+    """Quality score for comparing dynamic-vs-static extraction on same warped image."""
+    score = 0.0
+    sbd_expected = int(config["regions"]["sbd"]["cols"])
+    mdt_expected = int(config["regions"]["mdt"]["cols"])
+
+    sbd = str(results.get("sbd", ""))[:sbd_expected].ljust(sbd_expected, "?")
+    mdt = str(results.get("mdt", ""))[:mdt_expected].ljust(mdt_expected, "?")
+    score += sum(8.0 for ch in sbd if ch != "?")
+    score -= sum(12.0 for ch in sbd if ch == "?")
+    score += sum(8.0 for ch in mdt if ch != "?")
+    score -= sum(12.0 for ch in mdt if ch == "?")
+
+    fc = results.get("fc", {})
+    for i in range(1, 41):
+        ans = fc.get(str(i), [])
+        if len(ans) == 1:
+            score += 2.5
+        elif len(ans) > 1:
+            score -= 7.0
+        else:
+            score -= 0.2
+
+    tf = results.get("tf", {})
+    for q in tf.values():
+        if not isinstance(q, dict):
+            continue
+        for ans in q.values():
+            if len(ans) == 1:
+                score += 1.0
+            elif len(ans) > 1:
+                score -= 2.5
+            else:
+                score -= 0.15
+
+    dg = results.get("dg", {})
+    for val in dg.values():
+        score += min(len(str(val)), 4) * 1.5
+
+    score -= len(errors) * 18.0
+    score -= len(warnings) * 0.6
+    return score
+
+
 def _process_loaded_image(img, image_path, config, debug=False, rotation_deg=0):
-    gray = preprocess(img, config)
     binary = preprocess_to_binary(img, config)
 
     corners, method = find_corners(img, binary, config)
     warp_w = config.get("warp_width", 1800)
     warp_h = config.get("warp_height", 2500)
 
-    warped = warp_perspective(img, corners, warp_w, warp_h)
+    warped, warp_matrix = warp_perspective(
+        img, corners, warp_w, warp_h, return_matrix=True
+    )
 
-    warped, skew_angle = deskew(warped)
-    if abs(skew_angle) > 0.3:
-        warped = cv2.resize(warped, (warp_w, warp_h), interpolation=cv2.INTER_CUBIC)
+    warped, skew_angle, deskew_matrix = deskew(warped, return_matrix=True)
 
-    warped, aligned = align_to_template(warped, config)
+    warped, aligned, align_matrix = align_to_template(
+        warped, config, return_matrix=True
+    )
     if aligned:
         method += "+aligned"
     if rotation_deg:
         method += f"+rot{rotation_deg}"
+
+    forward_h = _compose_homography(warp_matrix, deskew_matrix, align_matrix)
 
     warped_gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
     clahe_e = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
@@ -112,12 +227,76 @@ def _process_loaded_image(img, image_path, config, debug=False, rotation_deg=0):
         blurred_e, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
     )
 
-    results, errors, warnings = extract_all(warped_binary, config, warped_gray)
-    marked = visualize_results(warped, results, config)
+    dynamic_cfg = config.get("dynamic_layout", {})
+    layout_regions = None
+    layout_warnings = []
+    layout_diagnostics = {}
+    dynamic_applied = False
+    if dynamic_cfg.get("enabled", False):
+        layout_regions, layout_warnings, layout_diagnostics = analyze_layout(
+            warped_binary, warped_gray, config
+        )
+    baseline_results, baseline_errors, baseline_warnings = extract_all(
+        warped_binary,
+        config,
+        warped_gray,
+        layout_regions=None
+    )
+    results = baseline_results
+    errors = baseline_errors
+    warnings = list(baseline_warnings)
+
+    if dynamic_cfg.get("enabled", False):
+        if layout_regions:
+            dynamic_results, dynamic_errors, dynamic_warnings = extract_all(
+                warped_binary,
+                config,
+                warped_gray,
+                layout_regions=layout_regions
+            )
+            baseline_quality = _extraction_quality(
+                baseline_results, baseline_errors, baseline_warnings, config
+            )
+            dynamic_quality = _extraction_quality(
+                dynamic_results, dynamic_errors, dynamic_warnings, config
+            )
+            quality_margin = float(dynamic_cfg.get("quality_margin", -2.0))
+            if dynamic_quality >= (baseline_quality + quality_margin):
+                results = dynamic_results
+                errors = dynamic_errors
+                warnings = list(dynamic_warnings)
+                dynamic_applied = True
+                method += "+dynlayout"
+                layout_diagnostics["dynamic_quality"] = round(dynamic_quality, 2)
+                layout_diagnostics["baseline_quality"] = round(baseline_quality, 2)
+            else:
+                method += "+dynreject"
+                warnings.append(
+                    f"Dynamic layout rejected (quality {dynamic_quality:.1f} < baseline {baseline_quality:.1f})."
+                )
+        else:
+            method += "+dynfallback"
+
+    if layout_warnings:
+        warnings = list(layout_warnings) + list(warnings)
+
+    mark_layer = create_mark_layer(warped.shape, results, config)
+    marked_rotated = _project_marks_to_input(img, mark_layer, forward_h)
+    marked = _undo_input_rotation(marked_rotated, rotation_deg)
 
     debug_img = None
     if debug:
         debug_img = create_debug_image(warped, warped_binary, config)
+
+    if dynamic_cfg.get("enabled", False):
+        if dynamic_applied:
+            layout_mode = "dynamic"
+        elif layout_regions:
+            layout_mode = "rejected"
+        else:
+            layout_mode = "fallback"
+    else:
+        layout_mode = "disabled"
 
     output = {
         "org": image_path,
@@ -134,6 +313,15 @@ def _process_loaded_image(img, image_path, config, debug=False, rotation_deg=0):
         "_detection_method": method,
         "_skew_angle": round(skew_angle, 2),
         "_rotation_deg": rotation_deg,
+        "_layout_dynamic": bool(dynamic_applied),
+        "_layout_mode": layout_mode,
+        "_layout_candidate_count": int(layout_diagnostics.get("candidate_count", 0)),
+        "_layout_component_count": int(layout_diagnostics.get("component_count", 0)),
+        "_layout_anchor_count": int(layout_diagnostics.get("anchor_count", 0)),
+        "_layout_resolved_sections_raw": list(layout_diagnostics.get("resolved_sections", [])),
+        "_layout_resolved_sections": list(layout_diagnostics.get("resolved_sections", [])) if dynamic_applied else [],
+        "_tf_confidence": results.get("_tf_confidence", {}),
+        "_dg_confidence": results.get("_dg_confidence", {}),
     }
 
     return output, marked, debug_img
@@ -176,65 +364,6 @@ def process_image(image_path, config, debug=False):
 
     return best_output, best_marked, best_debug
 
-    # 2. Tiền xử lý
-    gray = preprocess(img, config)
-    binary = preprocess_to_binary(img, config)
-
-    # 3. Phát hiện phiếu và warp
-    corners, method = find_corners(img, binary, config)
-    warp_w = config.get("warp_width", 1800)
-    warp_h = config.get("warp_height", 2500)
-
-    warped = warp_perspective(img, corners, warp_w, warp_h)
-
-    # 3.5. Deskew - chỉnh nghiêng sau khi warp
-    warped, skew_angle = deskew(warped)
-    if abs(skew_angle) > 0.3:
-        warped = cv2.resize(warped, (warp_w, warp_h), interpolation=cv2.INTER_CUBIC)
-
-    # 3.6. Căn chỉnh theo template
-    warped, aligned = align_to_template(warped, config)
-    if aligned:
-        method += "+aligned"
-
-    # Tạo binary Otsu cho extraction (độ tương phản tốt hơn adaptive)
-    warped_gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
-    clahe_e = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    enhanced_e = clahe_e.apply(warped_gray)
-    blurred_e = cv2.GaussianBlur(enhanced_e, (5, 5), 0)
-    _, warped_binary = cv2.threshold(
-        blurred_e, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
-    )
-
-    # 4. Trích xuất đáp án
-    results, errors, warnings = extract_all(warped_binary, config, warped_gray)
-
-    # 5. Vẽ kết quả lên ảnh
-    marked = visualize_results(warped, results, config)
-
-    # 6. Ảnh debug (nếu cần)
-    debug_img = None
-    if debug:
-        debug_img = create_debug_image(warped, warped_binary, config)
-
-    # 7. Tạo output theo mẫu
-    output = {
-        "org": image_path,
-        "out": "",
-        "warn": "; ".join(warnings) if warnings else "",
-        "err": errors,
-        "res": {
-            "fc": results["fc"],
-            "tf": results["tf"],
-            "dg": results["dg"]
-        },
-        "sbd": results["sbd"],
-        "mdt": results["mdt"],
-        "_detection_method": method,
-        "_skew_angle": round(skew_angle, 2)
-    }
-
-    return output, marked, debug_img
 
 
 def format_results(output, config):
@@ -349,6 +478,8 @@ def process_batch(image_paths, config, output_dir="results", debug=False):
         list of output_dicts
     """
     os.makedirs(output_dir, exist_ok=True)
+    per_file_dir = os.path.join(output_dir, "per_file_results")
+    os.makedirs(per_file_dir, exist_ok=True)
     all_results = []
 
     for i, path in enumerate(image_paths):
@@ -356,18 +487,26 @@ def process_batch(image_paths, config, output_dir="results", debug=False):
 
         output, marked, debug_img = process_image(path, config, debug)
 
+        base_name = os.path.splitext(os.path.basename(path))[0]
+        ext_tag = os.path.splitext(os.path.basename(path))[1].lower().lstrip(".") or "img"
+        result_stem = f"{base_name}_{ext_tag}"
+
         # Lưu ảnh đã đánh dấu
         if marked is not None:
-            base_name = os.path.splitext(os.path.basename(path))[0]
-            out_path = os.path.join(output_dir, f"marked_{base_name}.jpg")
+            out_path = os.path.join(output_dir, f"marked_{result_stem}.jpg")
             cv2.imwrite(out_path, marked)
             output["out"] = out_path
 
             if debug and debug_img is not None:
                 debug_dir = os.path.join(output_dir, "debug")
                 os.makedirs(debug_dir, exist_ok=True)
-                dbg_path = os.path.join(debug_dir, f"debug_{base_name}.jpg")
+                dbg_path = os.path.join(debug_dir, f"debug_{result_stem}.jpg")
                 cv2.imwrite(dbg_path, debug_img)
+
+        # Lưu JSON riêng cho từng ảnh
+        per_file_json_path = os.path.join(per_file_dir, f"result_{result_stem}.json")
+        with open(per_file_json_path, "w", encoding="utf-8") as f:
+            json.dump(output, f, ensure_ascii=False, indent=2)
 
         all_results.append(output)
 

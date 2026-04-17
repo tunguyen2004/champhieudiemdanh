@@ -9,6 +9,7 @@ Hệ thống tự động nhận diện và trích xuất đáp án từ phiếu
 - **Xử lý lỗi**: Cảnh báo tô nhiều đáp án, bỏ trống, phiếu hỏng
 - **Giao diện web**: Upload, xem kết quả, tải JSON/CSV
 - **Xử lý hàng loạt**: Chấm nhiều phiếu cùng lúc
+- **Dynamic layout (experimental)**: Suy vùng SBD/MDT/FC/TF/DG theo cấu trúc bubble, có fallback tự động về `config.json`
 
 ## Cài đặt
 

@@ -207,7 +207,7 @@ def find_corners(img, binary, config=None):
     return corners, "contour"
 
 
-def warp_perspective(img, corners, target_w, target_h):
+def warp_perspective(img, corners, target_w, target_h, return_matrix=False):
     """Biến đổi phối cảnh - trải phẳng phiếu về kích thước chuẩn."""
     dst = np.float32([
         [0, 0],
@@ -217,19 +217,23 @@ def warp_perspective(img, corners, target_w, target_h):
     ])
     matrix = cv2.getPerspectiveTransform(corners.astype(np.float32), dst)
     warped = cv2.warpPerspective(img, matrix, (target_w, target_h))
+    if return_matrix:
+        return warped, matrix
     return warped
 
 
-def deskew(img):
+def deskew(img, return_matrix=False):
     """
     Chỉnh nghiêng ảnh dựa trên HoughLines.
     Hoạt động với cả ảnh màu (BGR) và grayscale.
-    Trả về (ảnh_đã_xoay, góc_xoay_độ).
+    Trả về (ảnh_đã_xoay, góc_xoay_độ[, ma_trận_3x3]).
     """
     if len(img.shape) == 3:
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     else:
         gray = img
+
+    identity = np.eye(3, dtype=np.float32)
 
     # Phát hiện cạnh
     edges = cv2.Canny(gray, 50, 150)
@@ -240,6 +244,8 @@ def deskew(img):
                              maxLineGap=15)
 
     if lines is None:
+        if return_matrix:
+            return img, 0.0, identity
         return img, 0.0
 
     # Thu thập góc của đường gần ngang và gần dọc
@@ -261,43 +267,45 @@ def deskew(img):
     # Tính góc trung bình có trọng số (ưu tiên đường dài)
     all_weighted = h_angles + v_angles
     if not all_weighted:
+        if return_matrix:
+            return img, 0.0, identity
         return img, 0.0
 
     total_weight = sum(w for _, w in all_weighted)
     if total_weight == 0:
+        if return_matrix:
+            return img, 0.0, identity
         return img, 0.0
     weighted_angle = sum(a * w for a, w in all_weighted) / total_weight
 
     # Chỉ xoay nếu góc nghiêng đáng kể (>0.3°)
     if abs(weighted_angle) < 0.3:
+        if return_matrix:
+            return img, 0.0, identity
         return img, 0.0
 
     # Giới hạn góc xoay tối đa ±15° (phiếu quá nghiêng = lỗi khác)
     if abs(weighted_angle) > 15:
+        if return_matrix:
+            return img, 0.0, identity
         return img, 0.0
 
     h, w = img.shape[:2]
     center = (w // 2, h // 2)
-    rotation_matrix = cv2.getRotationMatrix2D(center, weighted_angle, 1.0)
+    rotation_matrix = cv2.getRotationMatrix2D(center, weighted_angle, 1.0).astype(np.float32)
 
-    # Tính kích thước ảnh mới để không bị cắt viền
-    cos_a = abs(np.cos(np.radians(weighted_angle)))
-    sin_a = abs(np.sin(np.radians(weighted_angle)))
-    new_w = int(w * cos_a + h * sin_a)
-    new_h = int(w * sin_a + h * cos_a)
-    rotation_matrix[0, 2] += (new_w - w) / 2
-    rotation_matrix[1, 2] += (new_h - h) / 2
+    # Giữ nguyên canvas để de-warp ngược ổn định.
+    rotated = cv2.warpAffine(
+        img,
+        rotation_matrix,
+        (w, h),
+        flags=cv2.INTER_CUBIC,
+        borderMode=cv2.BORDER_REPLICATE
+    )
 
-    rotated = cv2.warpAffine(img, rotation_matrix, (new_w, new_h),
-                              flags=cv2.INTER_CUBIC,
-                              borderMode=cv2.BORDER_REPLICATE)
-
-    # Crop lại về kích thước gốc (cắt viền trắng)
-    if new_w > w or new_h > h:
-        dx = (new_w - w) // 2
-        dy = (new_h - h) // 2
-        rotated = rotated[dy:dy+h, dx:dx+w]
-
+    if return_matrix:
+        affine_3x3 = np.vstack([rotation_matrix, [0.0, 0.0, 1.0]]).astype(np.float32)
+        return rotated, weighted_angle, affine_3x3
     return rotated, weighted_angle
 
 
@@ -363,20 +371,25 @@ class TemplateAligner:
         self._available = self._des_tpl is not None and len(self._des_tpl) > 50
         self._initialized = True
 
-    def align(self, warped, template_path, target_w, target_h):
+    def align(self, warped, template_path, target_w, target_h, return_matrix=False):
         """
         Căn chỉnh ảnh warped theo template.
-        Returns: (aligned_image, success_bool)
+        Returns: (aligned_image, success_bool[, homography_3x3])
         """
         self._init_template(template_path, target_w, target_h)
+        identity = np.eye(3, dtype=np.float32)
 
         if not self._available:
+            if return_matrix:
+                return warped, False, identity
             return warped, False
 
         gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY) if len(warped.shape) == 3 else warped
         kp_img, des_img = self._orb.detectAndCompute(gray, None)
 
         if des_img is None or len(des_img) < 20:
+            if return_matrix:
+                return warped, False, identity
             return warped, False
 
         # KNN matching + ratio test
@@ -389,6 +402,8 @@ class TemplateAligner:
                     good.append(m)
 
         if len(good) < 20:
+            if return_matrix:
+                return warped, False, identity
             return warped, False
 
         src_pts = np.float32(
@@ -400,20 +415,26 @@ class TemplateAligner:
 
         Mh, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
         if Mh is None:
+            if return_matrix:
+                return warped, False, identity
             return warped, False
 
         inliers = mask.ravel().sum()
         if inliers < 15:
+            if return_matrix:
+                return warped, False, identity
             return warped, False
 
         aligned = cv2.warpPerspective(warped, Mh, (target_w, target_h))
+        if return_matrix:
+            return aligned, True, Mh.astype(np.float32)
         return aligned, True
 
 
-def align_to_template(warped, config):
+def align_to_template(warped, config, return_matrix=False):
     """
     Căn chỉnh ảnh warped theo template sử dụng ORB feature matching.
-    Returns: (aligned_image, success_bool)
+    Returns: (aligned_image, success_bool[, homography_3x3])
     """
     template_path = config.get(
         "template_path",
@@ -423,4 +444,10 @@ def align_to_template(warped, config):
     target_h = config.get("warp_height", 2500)
 
     aligner = TemplateAligner()
-    return aligner.align(warped, template_path, target_w, target_h)
+    return aligner.align(
+        warped,
+        template_path,
+        target_w,
+        target_h,
+        return_matrix=return_matrix
+    )

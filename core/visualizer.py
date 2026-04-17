@@ -148,7 +148,8 @@ def visualize_results(warped_img, results, config):
     # --- FC (Phần I) ---
     fc_data = results.get("fc", {})
     fc_labels = regions["fc"]["labels"]
-    for group in regions["fc"]["groups"]:
+    fc_groups = results.get("_fc_groups", regions["fc"]["groups"])
+    for group in fc_groups:
         start_q = group["start_question"]
         for r in range(group["rows"]):
             q_num = str(start_q + r)
@@ -167,9 +168,10 @@ def visualize_results(warped_img, results, config):
 
     # --- TF (Phần II) ---
     tf_data = results.get("tf", {})
+    tf_groups = results.get("_tf_groups", regions["tf"]["groups"])
     tf_labels = regions["tf"]["labels"]
     tf_margin = config.get("tf_bubble_margin", margin)
-    for group_index, group in enumerate(regions["tf"]["groups"], start=1):
+    for group_index, group in enumerate(tf_groups, start=1):
         for r in range(group["rows"]):
             filled = _get_tf_filled(tf_data, group, group_index, r)
             for c in range(group["cols"]):
@@ -187,18 +189,18 @@ def visualize_results(warped_img, results, config):
                     cv2.rectangle(marked, (x1, y1), (x2, y2), COLOR_EMPTY, 1)
 
     # --- DG (Phần III) ---
-    dg_data = results.get("dg", {})
     dg_marks = results.get("_dg_marks", {})
+    dg_regions = results.get("_dg_regions", {})
     dg_labels = regions["dg"]["labels"]
     dg_rows = regions["dg"]["rows"]
     for group in regions["dg"]["groups"]:
         q_key = str(group["question"])
         selected_rows = dg_marks.get(q_key, [])
-        region = {
+        region = dg_regions.get(q_key, {
             "x1": group["x1"], "y1": group["y1"],
             "x2": group["x2"], "y2": group["y2"],
             "rows": dg_rows, "cols": group["cols"]
-        }
+        })
         for r in range(dg_rows):
             for c in range(group["cols"]):
                 rect = get_bubble_rect(region, r, c, w, h, margin)
@@ -222,6 +224,101 @@ def visualize_results(warped_img, results, config):
                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, COLOR_TEXT, 2)
 
     return marked
+
+
+def create_mark_layer(image_shape, results, config):
+    """
+    Táº¡o lá»›p Ä‘Ã¡nh dáº¥u chá»‰ gá»“m cÃ¡c bubble Ä‘Æ°á»£c chá»n.
+    Dá»¯ liá»‡u nÃ y dÃ¹ng Ä‘á»ƒ chiáº¿u ngÆ°á»£c vá» áº£nh gá»‘c.
+    """
+    h, w = image_shape[:2]
+    layer = np.zeros((h, w, 3), dtype=np.uint8)
+    margin = config.get("bubble_margin", 0.15)
+    regions = config["regions"]
+
+    # --- SBD ---
+    sbd_region = results.get("_sbd_region", regions["sbd"])
+    sbd_marks = results.get("_sbd_marks") or _row_marks_from_text(
+        results.get("sbd", ""),
+        sbd_region["labels"],
+        sbd_region["cols"]
+    )
+    for col in range(sbd_region["cols"]):
+        row = sbd_marks[col] if col < len(sbd_marks) else None
+        if row is None:
+            continue
+        rect = get_bubble_rect(sbd_region, row, col, w, h, margin)
+        _mark_bubble(layer, layer, rect, COLOR_FILLED)
+
+    # --- MÄT ---
+    mdt_region = results.get("_mdt_region", regions["mdt"])
+    mdt_marks = results.get("_mdt_marks") or _row_marks_from_text(
+        results.get("mdt", ""),
+        mdt_region["labels"],
+        mdt_region["cols"]
+    )
+    for col in range(mdt_region["cols"]):
+        row = mdt_marks[col] if col < len(mdt_marks) else None
+        if row is None:
+            continue
+        rect = get_bubble_rect(mdt_region, row, col, w, h, margin)
+        _mark_bubble(layer, layer, rect, COLOR_FILLED)
+
+    # --- FC ---
+    fc_data = results.get("fc", {})
+    fc_groups = results.get("_fc_groups", regions["fc"]["groups"])
+    for group in fc_groups:
+        start_q = group["start_question"]
+        for r in range(group["rows"]):
+            q_num = str(start_q + r)
+            filled = fc_data.get(q_num, [])
+            if not isinstance(filled, list):
+                continue
+            color = COLOR_ERROR if len(filled) > 1 else COLOR_FILLED
+            for c in filled:
+                rect = get_bubble_rect(group, r, c, w, h, margin)
+                _mark_bubble(layer, layer, rect, color)
+
+    # --- TF ---
+    tf_data = results.get("tf", {})
+    tf_groups = results.get("_tf_groups", regions["tf"]["groups"])
+    tf_margin = config.get("tf_bubble_margin", margin)
+    for group_index, group in enumerate(tf_groups, start=1):
+        for r in range(group["rows"]):
+            filled = _get_tf_filled(tf_data, group, group_index, r)
+            if not isinstance(filled, list):
+                continue
+            color = COLOR_ERROR if len(filled) > 1 else COLOR_FILLED
+            for c in filled:
+                rect = get_bubble_rect(group, r, c, w, h, tf_margin)
+                _mark_bubble(
+                    layer,
+                    layer,
+                    rect,
+                    color,
+                    radius_scale=TF_MARK_RADIUS_SCALE
+                )
+
+    # --- DG ---
+    dg_marks = results.get("_dg_marks", {})
+    dg_regions = results.get("_dg_regions", {})
+    dg_rows = regions["dg"]["rows"]
+    for group in regions["dg"]["groups"]:
+        q_key = str(group["question"])
+        selected_rows = dg_marks.get(q_key, [])
+        region = dg_regions.get(q_key, {
+            "x1": group["x1"], "y1": group["y1"],
+            "x2": group["x2"], "y2": group["y2"],
+            "rows": dg_rows, "cols": group["cols"]
+        })
+        for c in range(group["cols"]):
+            row = selected_rows[c] if c < len(selected_rows) else None
+            if row is None:
+                continue
+            rect = get_bubble_rect(region, row, c, w, h, margin)
+            _mark_bubble(layer, layer, rect, COLOR_FILLED)
+
+    return layer
 
 
 def _draw_id_grid(marked, overlay, binary, region, margin, fill_threshold):
